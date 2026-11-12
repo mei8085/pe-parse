@@ -28,12 +28,29 @@ THE SOFTWARE.
 #include <cstring>
 #include <iostream>
 #include <limits>
+#include <memory>
 #include <stdexcept>
 #include <vector>
 
 #include <pe-parse/nt-headers.h>
 #include <pe-parse/parse.h>
 #include <pe-parse/to_string.h>
+
+namespace {
+
+// Owning pointer for bounded_buffer views created while parsing. Views are
+// released with deleteBuffer, so an early return from any layer of the parse
+// releases every temporary view exactly once.
+struct bounded_buffer_deleter {
+  void operator()(peparse::bounded_buffer *b) const {
+    peparse::deleteBuffer(b);
+  }
+};
+
+using bounded_buffer_ptr =
+    std::unique_ptr<peparse::bounded_buffer, bounded_buffer_deleter>;
+
+} // anonymous namespace
 
 namespace peparse {
 
@@ -138,6 +155,21 @@ struct symbol {
 };
 
 struct parsed_pe_internal {
+  // The parse context owns every sub-buffer created while parsing. Releasing
+  // them here keeps cleanup correct no matter which parse stage failed and
+  // which entries were only partially constructed.
+  ~parsed_pe_internal() {
+    for (section &s : secs) {
+      deleteBuffer(s.sectionData);
+    }
+    for (resource &r : rsrcs) {
+      deleteBuffer(r.buf);
+    }
+    for (debugent &d : debugdirs) {
+      deleteBuffer(d.data);
+    }
+  }
+
   std::vector<section> secs;
   std::vector<resource> rsrcs;
   std::vector<importent> imports;
@@ -793,25 +825,29 @@ bool parse_resource_table(bounded_buffer *sectionData,
   for (std::uint32_t i = 0;
        i < static_cast<std::uint32_t>(rdt.NameEntries + rdt.IDEntries);
        i++) {
+    // Each recursion level owns its entry only when it allocated the entry
+    // itself; deeper levels borrow the caller's entry. The guard releases a
+    // self-allocated entry on every early return, no matter how the
+    // recursive parse of the levels below fails.
+    std::unique_ptr<resource_dir_entry> ownedEntry;
     resource_dir_entry *rde = dirent;
-    if (dirent == nullptr) {
-      rde = new resource_dir_entry;
+    if (rde == nullptr) {
+      ownedEntry.reset(new (std::nothrow) resource_dir_entry);
+      if (ownedEntry == nullptr) {
+        PE_ERR(PEERR_MEM);
+        return false;
+      }
+      rde = ownedEntry.get();
     }
 
     if (!readDword(sectionData, o + offsetof(__typeof__(*rde), ID), rde->ID)) {
       PE_ERR(PEERR_READ);
-      if (dirent == nullptr) {
-        delete rde;
-      }
       return false;
     }
 
     if (!readDword(
             sectionData, o + offsetof(__typeof__(*rde), RVA), rde->RVA)) {
       PE_ERR(PEERR_READ);
-      if (dirent == nullptr) {
-        delete rde;
-      }
       return false;
     }
 
@@ -822,9 +858,6 @@ bool parse_resource_table(bounded_buffer *sectionData,
       if (i < rdt.NameEntries) {
         if (!parse_resource_id(
                 sectionData, rde->ID & 0x0FFFFFFF, rde->type_str)) {
-          if (dirent == nullptr) {
-            delete rde;
-          }
           return false;
         }
       }
@@ -833,9 +866,6 @@ bool parse_resource_table(bounded_buffer *sectionData,
       if (i < rdt.NameEntries) {
         if (!parse_resource_id(
                 sectionData, rde->ID & 0x0FFFFFFF, rde->name_str)) {
-          if (dirent == nullptr) {
-            delete rde;
-          }
           return false;
         }
       }
@@ -844,9 +874,6 @@ bool parse_resource_table(bounded_buffer *sectionData,
       if (i < rdt.NameEntries) {
         if (!parse_resource_id(
                 sectionData, rde->ID & 0x0FFFFFFF, rde->lang_str)) {
-          if (dirent == nullptr) {
-            delete rde;
-          }
           return false;
         }
       }
@@ -870,9 +897,6 @@ bool parse_resource_table(bounded_buffer *sectionData,
                                 depth + 1,
                                 rde,
                                 rsrcs)) {
-        if (dirent == nullptr) {
-          delete rde;
-        }
         return false;
       }
     } else {
@@ -891,9 +915,6 @@ bool parse_resource_table(bounded_buffer *sectionData,
                      rde->RVA + offsetof(__typeof__(rdat), RVA),
                      rdat.RVA)) {
         PE_ERR(PEERR_READ);
-        if (dirent == nullptr) {
-          delete rde;
-        }
         return false;
       }
 
@@ -901,9 +922,6 @@ bool parse_resource_table(bounded_buffer *sectionData,
                      rde->RVA + offsetof(__typeof__(rdat), size),
                      rdat.size)) {
         PE_ERR(PEERR_READ);
-        if (dirent == nullptr) {
-          delete rde;
-        }
         return false;
       }
 
@@ -911,9 +929,6 @@ bool parse_resource_table(bounded_buffer *sectionData,
                      rde->RVA + offsetof(__typeof__(rdat), codepage),
                      rdat.codepage)) {
         PE_ERR(PEERR_READ);
-        if (dirent == nullptr) {
-          delete rde;
-        }
         return false;
       }
 
@@ -921,9 +936,6 @@ bool parse_resource_table(bounded_buffer *sectionData,
                      rde->RVA + offsetof(__typeof__(rdat), reserved),
                      rdat.reserved)) {
         PE_ERR(PEERR_READ);
-        if (dirent == nullptr) {
-          delete rde;
-        }
         return false;
       }
 
@@ -946,24 +958,25 @@ bool parse_resource_table(bounded_buffer *sectionData,
        * If the start is valid, try to get the data and if that fails return
        * a zero length buffer.
        */
+      bounded_buffer_ptr rsrcBuf;
       if (start > rdat.RVA) {
-        rsrc.buf = splitBuffer(sectionData, 0, 0);
+        rsrcBuf.reset(splitBuffer(sectionData, 0, 0));
       } else {
-        rsrc.buf = splitBuffer(sectionData, start, start + rdat.size);
-        if (rsrc.buf == nullptr) {
-          rsrc.buf = splitBuffer(sectionData, 0, 0);
+        rsrcBuf.reset(splitBuffer(sectionData, start, start + rdat.size));
+        if (rsrcBuf == nullptr) {
+          rsrcBuf.reset(splitBuffer(sectionData, 0, 0));
         }
       }
 
       /* If we can't get even a zero length buffer, something is very wrong. */
-      if (rsrc.buf == nullptr) {
-        if (dirent == nullptr) {
-          delete rde;
-        }
+      if (rsrcBuf == nullptr) {
         return false;
       }
 
+      // The parse context takes ownership of the buffer.
+      rsrc.buf = rsrcBuf.get();
       rsrcs.push_back(rsrc);
+      rsrcBuf.release();
     }
 
     if (depth == 0) {
@@ -972,10 +985,6 @@ bool parse_resource_table(bounded_buffer *sectionData,
       rde->name_str.clear();
     } else if (depth == 2) {
       rde->lang_str.clear();
-    }
-
-    if (dirent == nullptr) {
-      delete rde;
     }
   }
 
@@ -1060,18 +1069,21 @@ bool getSections(bounded_buffer *b,
     }
 
     thisSec.sec = curSec;
-    thisSec.sectionData = splitBufferByLength(
-        fileBegin, curSec.PointerToRawData, curSec.SizeOfRawData);
+    bounded_buffer_ptr secData(splitBufferByLength(
+        fileBegin, curSec.PointerToRawData, curSec.SizeOfRawData));
 
     // GH#109: we trusted section raw data to be a range that yields
     // a valid bounded_buffer, despite these being user-controllable.
     // splitBufferByLength correctly handles this, but we failed to check for
     // the nullptr it returns as a sentinel.
-    if (thisSec.sectionData == nullptr) {
+    if (secData == nullptr) {
       return false;
     }
 
+    // The parse context takes ownership of the buffer.
+    thisSec.sectionData = secData.get();
     secs.push_back(thisSec);
+    secData.release();
   }
 
   std::sort(
@@ -1218,16 +1230,15 @@ bool readNtHeader(bounded_buffer *b, nt_header_32 &header) {
   }
 
   header.Signature = pe_magic;
-  bounded_buffer *fhb =
-      splitBuffer(b, offsetof(nt_header_32, FileHeader), b->bufLen);
+  bounded_buffer_ptr fhb(
+      splitBuffer(b, offsetof(nt_header_32, FileHeader), b->bufLen));
 
   if (fhb == nullptr) {
     PE_ERR(PEERR_MEM);
     return false;
   }
 
-  if (!readFileHeader(fhb, header.FileHeader)) {
-    deleteBuffer(fhb);
+  if (!readFileHeader(fhb.get(), header.FileHeader)) {
     return false;
   }
 
@@ -1257,11 +1268,10 @@ bool readNtHeader(bounded_buffer *b, nt_header_32 &header) {
    * out to be a PE32+. The start of the buffer is at the same spot in the
    * buffer regardless.
    */
-  bounded_buffer *ohb =
-      splitBuffer(b, offsetof(nt_header_32, OptionalHeader), b->bufLen);
+  bounded_buffer_ptr ohb(
+      splitBuffer(b, offsetof(nt_header_32, OptionalHeader), b->bufLen));
 
   if (ohb == nullptr) {
-    deleteBuffer(fhb);
     PE_ERR(PEERR_MEM);
     return false;
   }
@@ -1269,35 +1279,22 @@ bool readNtHeader(bounded_buffer *b, nt_header_32 &header) {
   /*
    * Read the Magic to determine if it is 32 or 64.
    */
-  if (!readWord(ohb, 0, header.OptionalMagic)) {
+  if (!readWord(ohb.get(), 0, header.OptionalMagic)) {
     PE_ERR(PEERR_READ);
-    if (ohb != nullptr) {
-      deleteBuffer(ohb);
-    }
-    deleteBuffer(fhb);
     return false;
   }
   if (header.OptionalMagic == NT_OPTIONAL_32_MAGIC) {
-    if (!readOptionalHeader(ohb, header.OptionalHeader)) {
-      deleteBuffer(ohb);
-      deleteBuffer(fhb);
+    if (!readOptionalHeader(ohb.get(), header.OptionalHeader)) {
       return false;
     }
   } else if (header.OptionalMagic == NT_OPTIONAL_64_MAGIC) {
-    if (!readOptionalHeader64(ohb, header.OptionalHeader64)) {
-      deleteBuffer(ohb);
-      deleteBuffer(fhb);
+    if (!readOptionalHeader64(ohb.get(), header.OptionalHeader64)) {
       return false;
     }
   } else {
     PE_ERR(PEERR_MAGIC);
-    deleteBuffer(ohb);
-    deleteBuffer(fhb);
     return false;
   }
-
-  deleteBuffer(ohb);
-  deleteBuffer(fhb);
 
   return true;
 }
@@ -1515,32 +1512,26 @@ bool getHeader(bounded_buffer *file, pe_header &p, bounded_buffer *&rem) {
     }
 
     // Split the Rich header out into its own buffer
-    bounded_buffer *richBuf =
-        splitBuffer(file, 0x80, rich_end_signature_offset + 4);
+    bounded_buffer_ptr richBuf(
+        splitBuffer(file, 0x80, rich_end_signature_offset + 4));
     if (richBuf == nullptr) {
       return false;
     }
 
-    readRichHeader(richBuf, xor_key, p.rich);
-    if (richBuf != nullptr) {
-      deleteBuffer(richBuf);
-    }
+    readRichHeader(richBuf.get(), xor_key, p.rich);
 
     // Split the DOS header into a separate buffer which
     // starts at offset 0 and has length 0x80
-    bounded_buffer *dosBuf = splitBuffer(file, 0, RICH_OFFSET);
+    bounded_buffer_ptr dosBuf(splitBuffer(file, 0, RICH_OFFSET));
     if (dosBuf == nullptr) {
       return false;
     }
     // Calculate checksum
-    p.rich.Checksum = calculateRichChecksum(dosBuf, p);
+    p.rich.Checksum = calculateRichChecksum(dosBuf.get(), p);
     if (p.rich.Checksum == p.rich.DecryptionKey) {
       p.rich.isValid = true;
     } else {
       p.rich.isValid = false;
-    }
-    if (dosBuf != nullptr) {
-      deleteBuffer(dosBuf);
     }
 
     // Rich header not present
@@ -1549,13 +1540,10 @@ bool getHeader(bounded_buffer *file, pe_header &p, bounded_buffer *&rem) {
   }
 
   // now, we can read out the fields of the NT headers
-  bounded_buffer *ntBuf = splitBuffer(file, curOffset, file->bufLen);
+  bounded_buffer_ptr ntBuf(splitBuffer(file, curOffset, file->bufLen));
 
-  if (!readNtHeader(ntBuf, p.nt)) {
+  if (!readNtHeader(ntBuf.get(), p.nt)) {
     // err is set by readNtHeader
-    if (ntBuf != nullptr) {
-      deleteBuffer(ntBuf);
-    }
     return false;
   }
 
@@ -1574,13 +1562,12 @@ bool getHeader(bounded_buffer *file, pe_header &p, bounded_buffer *&rem) {
                sizeof(optional_header_64);
   } else {
     PE_ERR(PEERR_MAGIC);
-    deleteBuffer(ntBuf);
     return false;
   }
 
-  // update 'rem' to point to the space after the header
-  rem = splitBuffer(ntBuf, rem_size, ntBuf->bufLen);
-  deleteBuffer(ntBuf);
+  // update 'rem' to point to the space after the header; the caller takes
+  // ownership of the view
+  rem = splitBuffer(ntBuf.get(), rem_size, ntBuf->bufLen);
 
   return true;
 }
@@ -1971,16 +1958,19 @@ bool getDebugDir(parsed_pe *p) {
       debugent ent;
 
       auto dataofft = static_cast<std::uint32_t>(rawData - dataSec.sectionBase);
-      ent.data =
-          splitBufferByLength(dataSec.sectionData, dataofft, curEnt.SizeOfData);
-      if (ent.data == nullptr) {
+      bounded_buffer_ptr entData(splitBufferByLength(
+          dataSec.sectionData, dataofft, curEnt.SizeOfData));
+      if (entData == nullptr) {
         // The debug entry data stretches outside the containing section. It is
         // malformed. Skip it and the rest, similar to the above.
         break;
       }
       ent.type = curEnt.Type;
 
+      // The parse context takes ownership of the buffer.
+      ent.data = entData.get();
       p->internal->debugdirs.push_back(ent);
+      entData.release();
 
       rvaofft += sizeof(debug_dir_entry);
     }
@@ -2555,12 +2545,24 @@ bool getSymbolTable(parsed_pe *p) {
 }
 
 parsed_pe *ParsePEFromBuffer(bounded_buffer *buffer) {
-  // First, create a new parsed_pe structure
+  if (buffer == nullptr) {
+    PE_ERR(PEERR_BUFFER);
+    return nullptr;
+  }
+
+  // The parse context takes ownership of the file buffer on every path, and
+  // owns every sub-buffer created while parsing through parsed_pe_internal.
+  // Holding the context in a unique_ptr until the parse succeeds guarantees
+  // that no failure path can expose a partially constructed result, and that
+  // the buffer and all intermediate state are released exactly once.
+  //
   // We pass std::nothrow parameter to new so in case of failure it returns
   // nullptr instead of throwing exception std::bad_alloc.
-  parsed_pe *p = new (std::nothrow) parsed_pe();
+  std::unique_ptr<parsed_pe, void (*)(parsed_pe *)> p(
+      new (std::nothrow) parsed_pe(), &DestructParsedPE);
 
   if (p == nullptr) {
+    deleteBuffer(buffer);
     PE_ERR(PEERR_MEM);
     return nullptr;
   }
@@ -2571,76 +2573,62 @@ parsed_pe *ParsePEFromBuffer(bounded_buffer *buffer) {
   p->internal = new (std::nothrow) parsed_pe_internal();
 
   if (p->internal == nullptr) {
-    deleteBuffer(p->fileBuffer);
-    delete p;
     PE_ERR(PEERR_MEM);
     return nullptr;
   }
 
   // get header information
-  bounded_buffer *remaining = nullptr;
-  if (!getHeader(p->fileBuffer, p->peHeader, remaining)) {
-    deleteBuffer(remaining);
-    DestructParsedPE(p);
-    // err is set by getHeader
-    return nullptr;
+  bounded_buffer_ptr remaining;
+  {
+    bounded_buffer *rem = nullptr;
+    if (!getHeader(p->fileBuffer, p->peHeader, rem)) {
+      // err is set by getHeader
+      return nullptr;
+    }
+    remaining.reset(rem);
   }
 
   bounded_buffer *file = p->fileBuffer;
-  if (!getSections(remaining, file, p->peHeader.nt, p->internal->secs)) {
-    deleteBuffer(remaining);
-    DestructParsedPE(p);
+  if (!getSections(remaining.get(), file, p->peHeader.nt, p->internal->secs)) {
     PE_ERR(PEERR_SECT);
     return nullptr;
   }
 
-  if (!getResources(remaining, file, p->internal->secs, p->internal->rsrcs)) {
-    deleteBuffer(remaining);
-    DestructParsedPE(p);
+  if (!getResources(
+          remaining.get(), file, p->internal->secs, p->internal->rsrcs)) {
     PE_ERR(PEERR_RESC);
     return nullptr;
   }
 
   // Get exports
-  if (!getExports(p)) {
-    deleteBuffer(remaining);
-    DestructParsedPE(p);
+  if (!getExports(p.get())) {
     PE_ERR(PEERR_MAGIC);
     return nullptr;
   }
 
   // Get relocations, if exist
-  if (!getRelocations(p)) {
-    deleteBuffer(remaining);
-    DestructParsedPE(p);
+  if (!getRelocations(p.get())) {
     PE_ERR(PEERR_MAGIC);
     return nullptr;
   }
 
-  if (!getDebugDir(p)) {
-    deleteBuffer(remaining);
-    DestructParsedPE(p);
+  // Get debug directories, if exist
+  if (!getDebugDir(p.get())) {
     PE_ERR(PEERR_MAGIC);
     return nullptr;
   }
 
   // Get imports
-  if (!getImports(p)) {
-    deleteBuffer(remaining);
-    DestructParsedPE(p);
+  if (!getImports(p.get())) {
     return nullptr;
   }
 
   // Get symbol table
-  if (!getSymbolTable(p)) {
-    deleteBuffer(remaining);
-    DestructParsedPE(p);
+  if (!getSymbolTable(p.get())) {
     return nullptr;
   }
 
-  deleteBuffer(remaining);
-
-  return p;
+  return p.release();
 }
 
 parsed_pe *ParsePEFromFile(const char *filePath) {
@@ -2670,28 +2658,13 @@ void DestructParsedPE(parsed_pe *p) {
     return;
   }
 
+  // The file mapping is released together with the parse context. Section,
+  // resource and debug data buffers are views owned by parsed_pe_internal
+  // and are released by its destructor, so every buffer is released exactly
+  // once whether or not the parse completed.
   deleteBuffer(p->fileBuffer);
-
-  for (section s : p->internal->secs) {
-    if (s.sectionData != nullptr) {
-      deleteBuffer(s.sectionData);
-    }
-  }
-  for (resource r : p->internal->rsrcs) {
-    if (r.buf != nullptr) {
-      deleteBuffer(r.buf);
-    }
-  }
-
-  for (debugent d : p->internal->debugdirs) {
-    if (d.data != nullptr) {
-      deleteBuffer(d.data);
-    }
-  }
-
   delete p->internal;
   delete p;
-  return;
 }
 
 // iterate over the imports by VA and string
@@ -2932,15 +2905,14 @@ bool GetDataDirectoryEntry(parsed_pe *pe,
    * https://docs.microsoft.com/en-us/windows/win32/debug/pe-format#the-attribute-certificate-table-image-only
    */
   if (dirnum == DIR_SECURITY) {
-    auto *buf =
-        splitBufferByLength(pe->fileBuffer, dir.VirtualAddress, dir.Size);
+    bounded_buffer_ptr buf(
+        splitBufferByLength(pe->fileBuffer, dir.VirtualAddress, dir.Size));
     if (buf == nullptr) {
       PE_ERR(PEERR_SIZE);
       return false;
     }
 
     raw_entry.assign(buf->buf, buf->buf + buf->bufLen);
-    deleteBuffer(buf);
   } else {
     section sec;
     if (!getSecForVA(pe->internal->secs, addr, sec)) {
@@ -2949,14 +2921,13 @@ bool GetDataDirectoryEntry(parsed_pe *pe,
     }
 
     auto off = static_cast<std::uint32_t>(addr - sec.sectionBase);
-    auto *buf = splitBufferByLength(sec.sectionData, off, dir.Size);
+    bounded_buffer_ptr buf(splitBufferByLength(sec.sectionData, off, dir.Size));
     if (buf == nullptr) {
       PE_ERR(PEERR_SIZE);
       return false;
     }
 
     raw_entry.assign(buf->buf, buf->buf + buf->bufLen);
-    deleteBuffer(buf);
   }
 
   return true;

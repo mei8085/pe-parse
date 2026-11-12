@@ -197,12 +197,23 @@ std::string GetPEErrString();
 std::string GetPEErrLoc();
 
 // get a PE parse context from a file
+//
+// The parse context owns the file mapping and every sub-buffer (sections,
+// resources, debug data) created while parsing. On failure these functions
+// return nullptr and release all intermediate state; no partially parsed
+// result is ever exposed.
 parsed_pe *ParsePEFromFile(const char *filePath);
 
 parsed_pe *ParsePEFromPointer(std::uint8_t *buffer, std::uint32_t sz);
+
+// Parse a PE from a caller-provided buffer. Ownership of the buffer is
+// always transferred to the parser: it is released by DestructParsedPE on
+// success and released internally on failure, exactly once in both cases.
+// The caller must not use or release the buffer after this call.
 parsed_pe *ParsePEFromBuffer(bounded_buffer *buffer);
 
-// destruct a PE context
+// destruct a PE context, releasing the file buffer and all sub-buffers
+// owned by the context
 void DestructParsedPE(parsed_pe *p);
 
 // iterate over Rich header entries

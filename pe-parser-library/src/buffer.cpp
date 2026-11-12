@@ -223,55 +223,31 @@ bounded_buffer *readFileToFileBuffer(const char *filePath) {
     return nullptr;
   }
 
+  // Release the handles on every early return. Ownership is transferred to
+  // the buffer detail only after the view has been mapped successfully.
+  struct handle_holder {
+    HANDLE handle;
+    ~handle_holder() {
+      if (handle != nullptr) {
+        CloseHandle(handle);
+      }
+    }
+  } fileHolder{h};
+
   DWORD fileSize = GetFileSize(h, nullptr);
 
   if (fileSize == INVALID_FILE_SIZE) {
-    CloseHandle(h);
     PE_ERR(PEERR_OPEN);
     return nullptr;
   }
-
-#else
-  // only where we have mmap / open / etc
-  int fd = open(filePath, O_RDONLY);
-
-  if (fd == -1) {
-    PE_ERR(PEERR_OPEN);
-    return nullptr;
-  }
-#endif
-
-  // make a buffer object
-  bounded_buffer *p = new (std::nothrow) bounded_buffer();
-  if (p == nullptr) {
-    PE_ERR(PEERR_MEM);
-    return nullptr;
-  }
-
-  memset(p, 0, sizeof(bounded_buffer));
-  buffer_detail *d = new (std::nothrow) buffer_detail();
-
-  if (d == nullptr) {
-    delete p;
-    PE_ERR(PEERR_MEM);
-    return nullptr;
-  }
-  memset(d, 0, sizeof(buffer_detail));
-  p->detail = d;
-
-// only where we have mmap / open / etc
-#ifdef _WIN32
-  p->detail->file = h;
 
   HANDLE hMap = CreateFileMapping(h, nullptr, PAGE_READONLY, 0, 0, nullptr);
 
   if (hMap == nullptr) {
-    CloseHandle(h);
     PE_ERR(PEERR_MEM);
     return nullptr;
   }
-
-  p->detail->sec = hMap;
+  handle_holder mapHolder{hMap};
 
   LPVOID ptr = MapViewOfFile(hMap, FILE_MAP_READ, 0, 0, 0);
 
@@ -280,18 +256,58 @@ bounded_buffer *readFileToFileBuffer(const char *filePath) {
     return nullptr;
   }
 
+  // make a buffer object
+  bounded_buffer *p = new (std::nothrow) bounded_buffer();
+  if (p == nullptr) {
+    UnmapViewOfFile(ptr);
+    PE_ERR(PEERR_MEM);
+    return nullptr;
+  }
+
+  memset(p, 0, sizeof(bounded_buffer));
+  buffer_detail *d = new (std::nothrow) buffer_detail();
+
+  if (d == nullptr) {
+    UnmapViewOfFile(ptr);
+    delete p;
+    PE_ERR(PEERR_MEM);
+    return nullptr;
+  }
+  memset(d, 0, sizeof(buffer_detail));
+
+  // the buffer now owns the handles
+  fileHolder.handle = nullptr;
+  mapHolder.handle = nullptr;
+
+  p->detail = d;
+  p->detail->file = h;
+  p->detail->sec = hMap;
   p->buf = reinterpret_cast<std::uint8_t *>(ptr);
   p->bufLen = fileSize;
 #else
-  p->detail->fd = fd;
+  // only where we have mmap / open / etc
+  int fd = open(filePath, O_RDONLY);
+
+  if (fd == -1) {
+    PE_ERR(PEERR_OPEN);
+    return nullptr;
+  }
+
+  // Close the descriptor on every early return. Ownership is transferred to
+  // the buffer detail only after the file has been mapped successfully.
+  struct fd_holder {
+    int fd;
+    ~fd_holder() {
+      if (fd != -1) {
+        close(fd);
+      }
+    }
+  } fdHolder{fd};
 
   struct stat s;
   memset(&s, 0, sizeof(struct stat));
 
   if (fstat(fd, &s) != 0) {
-    close(fd);
-    delete d;
-    delete p;
     PE_ERR(PEERR_STAT);
     return nullptr;
   }
@@ -304,13 +320,34 @@ bounded_buffer *readFileToFileBuffer(const char *filePath) {
                      0);
 
   if (maddr == MAP_FAILED) {
-    close(fd);
-    delete d;
-    delete p;
     PE_ERR(PEERR_MEM);
     return nullptr;
   }
 
+  // make a buffer object
+  bounded_buffer *p = new (std::nothrow) bounded_buffer();
+  if (p == nullptr) {
+    munmap(maddr, static_cast<std::size_t>(s.st_size));
+    PE_ERR(PEERR_MEM);
+    return nullptr;
+  }
+
+  memset(p, 0, sizeof(bounded_buffer));
+  buffer_detail *d = new (std::nothrow) buffer_detail();
+
+  if (d == nullptr) {
+    munmap(maddr, static_cast<std::size_t>(s.st_size));
+    delete p;
+    PE_ERR(PEERR_MEM);
+    return nullptr;
+  }
+  memset(d, 0, sizeof(buffer_detail));
+
+  // the buffer now owns the descriptor
+  fdHolder.fd = -1;
+
+  p->detail = d;
+  p->detail->fd = fd;
   p->buf = reinterpret_cast<std::uint8_t *>(maddr);
   p->bufLen = static_cast<std::uint32_t>(s.st_size);
 #endif
