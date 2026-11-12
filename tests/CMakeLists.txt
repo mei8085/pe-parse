@@ -24,6 +24,7 @@ add_executable(tests
   simple_test.cpp
   corkami_test.cpp
   directory_bounds_test.cpp
+  resource_bounds_test.cpp
   pr_153_test.cpp
 
   filesystem_compat.h

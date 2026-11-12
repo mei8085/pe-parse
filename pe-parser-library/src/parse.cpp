@@ -29,6 +29,7 @@ THE SOFTWARE.
 #include <iostream>
 #include <limits>
 #include <stdexcept>
+#include <unordered_set>
 #include <vector>
 
 #include <pe-parse/nt-headers.h>
@@ -512,6 +513,10 @@ static const char *pe_err_str[] = {
     "Invalid buffer",
     "Invalid address",
     "Invalid size",
+    "Resource directory too deep",
+    "Too many resource directory entries",
+    "Resource directory contains a cycle",
+    "Resource directory read limit exceeded",
 };
 
 std::uint32_t GetPEErr() {
@@ -519,11 +524,36 @@ std::uint32_t GetPEErr() {
 }
 
 std::string GetPEErrString() {
+  if (err >= sizeof(pe_err_str) / sizeof(pe_err_str[0])) {
+    return "Unknown";
+  }
   return pe_err_str[err];
 }
 
 std::string GetPEErrLoc() {
   return err_loc;
+}
+
+namespace {
+// Default bounds for resource directory traversal. Three directory levels
+// match the type/name/language layout used by Windows; the node and read
+// budgets are generous enough for any well-formed resource section while
+// still bounding the work spent on hostile files.
+constexpr std::uint32_t kDefaultMaxResourceDepth = 3;
+constexpr std::uint32_t kDefaultMaxResourceNodes = 65536;
+constexpr std::uint64_t kDefaultMaxResourceReadBytes = 16 * 1024 * 1024;
+
+resource_parse_limits g_resourceParseLimits = {kDefaultMaxResourceDepth,
+                                               kDefaultMaxResourceNodes,
+                                               kDefaultMaxResourceReadBytes};
+} // namespace
+
+resource_parse_limits GetResourceParseLimits() {
+  return g_resourceParseLimits;
+}
+
+void SetResourceParseLimits(const resource_parse_limits &limits) {
+  g_resourceParseLimits = limits;
 }
 
 const char *GetSymbolTableStorageClassName(std::uint8_t id) {
@@ -742,11 +772,83 @@ void IterRsrc(parsed_pe *pe, iterRsrc cb, void *cbd) {
   }
 }
 
-bool parse_resource_id(bounded_buffer *data,
+namespace {
+
+// State shared by the whole resource directory traversal. It carries the
+// configured limits, the work counters used to enforce them, and the book
+// keeping needed to tell a true cycle (a table that references one of its
+// own ancestors) apart from a shared subtree (a table that is referenced
+// by more than one parent).
+struct resource_parse_context {
+  resource_parse_limits limits;
+  std::uint32_t nodes = 0;
+  std::uint64_t readBytes = 0;
+  // Offsets of the directory tables on the current traversal path.
+  std::vector<std::uint32_t> path;
+  // Offsets of every directory table parsed so far.
+  std::unordered_set<std::uint32_t> seen;
+};
+
+bool accountResourceRead(resource_parse_context &ctx, std::uint64_t bytes) {
+  if (ctx.readBytes > ctx.limits.maxReadBytes ||
+      bytes > ctx.limits.maxReadBytes - ctx.readBytes) {
+    PE_ERR(PEERR_RESC_WORK);
+    return false;
+  }
+  ctx.readBytes += bytes;
+  return true;
+}
+
+bool readResourceWord(resource_parse_context &ctx,
+                      bounded_buffer *b,
+                      std::uint32_t offset,
+                      std::uint16_t &out) {
+  if (!accountResourceRead(ctx, sizeof(out))) {
+    return false;
+  }
+  if (!readWord(b, offset, out)) {
+    PE_ERR(PEERR_READ);
+    return false;
+  }
+  return true;
+}
+
+bool readResourceDword(resource_parse_context &ctx,
+                       bounded_buffer *b,
+                       std::uint32_t offset,
+                       std::uint32_t &out) {
+  if (!accountResourceRead(ctx, sizeof(out))) {
+    return false;
+  }
+  if (!readDword(b, offset, out)) {
+    PE_ERR(PEERR_READ);
+    return false;
+  }
+  return true;
+}
+
+bool readResourceChar16(resource_parse_context &ctx,
+                        bounded_buffer *b,
+                        std::uint32_t offset,
+                        char16_t &out) {
+  if (!accountResourceRead(ctx, sizeof(out))) {
+    return false;
+  }
+  if (!readChar16(b, offset, out)) {
+    PE_ERR(PEERR_READ);
+    return false;
+  }
+  return true;
+}
+
+} // namespace
+
+bool parse_resource_id(resource_parse_context &ctx,
+                       bounded_buffer *data,
                        std::uint32_t id,
                        std::string &result) {
   std::uint16_t len;
-  if (!readWord(data, id, len)) {
+  if (!readResourceWord(ctx, data, id, len)) {
     return false;
   }
   id += 2;
@@ -755,7 +857,7 @@ bool parse_resource_id(bounded_buffer *data,
   UCharString rawString;
   for (std::uint32_t i = 0; i < rawSize; i += 2) {
     char16_t c;
-    if (!readChar16(data, id + i, c)) {
+    if (!readResourceChar16(ctx, data, id + i, c)) {
       return false;
     }
     rawString.push_back(c);
@@ -765,24 +867,60 @@ bool parse_resource_id(bounded_buffer *data,
   return true;
 }
 
-bool parse_resource_table(bounded_buffer *sectionData,
+bool parse_resource_table(resource_parse_context &ctx,
+                          bounded_buffer *sectionData,
                           std::uint32_t o,
                           std::uint32_t virtaddr,
                           std::uint32_t depth,
                           resource_dir_entry *dirent,
-                          std::vector<resource> &rsrcs) {
+                          std::vector<resource> &rsrcs);
+
+bool parse_resource_table_impl(resource_parse_context &ctx,
+                               bounded_buffer *sectionData,
+                               std::uint32_t o,
+                               std::uint32_t virtaddr,
+                               std::uint32_t depth,
+                               resource_dir_entry *dirent,
+                               std::vector<resource> &rsrcs) {
   resource_dir_table rdt;
 
-  if (sectionData == nullptr) {
+  if (!readResourceDword(
+          ctx,
+          sectionData,
+          o + offsetof(resource_dir_table, Characteristics),
+          rdt.Characteristics)) {
     return false;
   }
-
-  READ_DWORD(sectionData, o, rdt, Characteristics);
-  READ_DWORD(sectionData, o, rdt, TimeDateStamp);
-  READ_WORD(sectionData, o, rdt, MajorVersion);
-  READ_WORD(sectionData, o, rdt, MinorVersion);
-  READ_WORD(sectionData, o, rdt, NameEntries);
-  READ_WORD(sectionData, o, rdt, IDEntries);
+  if (!readResourceDword(ctx,
+                         sectionData,
+                         o + offsetof(resource_dir_table, TimeDateStamp),
+                         rdt.TimeDateStamp)) {
+    return false;
+  }
+  if (!readResourceWord(ctx,
+                        sectionData,
+                        o + offsetof(resource_dir_table, MajorVersion),
+                        rdt.MajorVersion)) {
+    return false;
+  }
+  if (!readResourceWord(ctx,
+                        sectionData,
+                        o + offsetof(resource_dir_table, MinorVersion),
+                        rdt.MinorVersion)) {
+    return false;
+  }
+  if (!readResourceWord(ctx,
+                        sectionData,
+                        o + offsetof(resource_dir_table, NameEntries),
+                        rdt.NameEntries)) {
+    return false;
+  }
+  if (!readResourceWord(ctx,
+                        sectionData,
+                        o + offsetof(resource_dir_table, IDEntries),
+                        rdt.IDEntries)) {
+    return false;
+  }
 
   o += sizeof(resource_dir_table);
 
@@ -798,17 +936,25 @@ bool parse_resource_table(bounded_buffer *sectionData,
       rde = new resource_dir_entry;
     }
 
-    if (!readDword(sectionData, o + offsetof(__typeof__(*rde), ID), rde->ID)) {
-      PE_ERR(PEERR_READ);
+    if (ctx.nodes >= ctx.limits.maxNodes) {
+      PE_ERR(PEERR_RESC_NODES);
+      if (dirent == nullptr) {
+        delete rde;
+      }
+      return false;
+    }
+    ++ctx.nodes;
+
+    if (!readResourceDword(
+            ctx, sectionData, o + offsetof(__typeof__(*rde), ID), rde->ID)) {
       if (dirent == nullptr) {
         delete rde;
       }
       return false;
     }
 
-    if (!readDword(
-            sectionData, o + offsetof(__typeof__(*rde), RVA), rde->RVA)) {
-      PE_ERR(PEERR_READ);
+    if (!readResourceDword(
+            ctx, sectionData, o + offsetof(__typeof__(*rde), RVA), rde->RVA)) {
       if (dirent == nullptr) {
         delete rde;
       }
@@ -817,11 +963,23 @@ bool parse_resource_table(bounded_buffer *sectionData,
 
     o += sizeof(resource_dir_entry_sz);
 
-    if (depth == 0) {
+    if (depth >= ctx.limits.maxDepth) {
+      /* .rsrc can accommodate up to 2**31 levels, but Windows only uses 3 by
+       * convention. As such, any depth above the configured limit indicates
+       * potentially unchecked recursion. See:
+       * https://docs.microsoft.com/en-us/windows/desktop/debug/pe-format#the-rsrc-section
+       */
+
+      PE_ERR(PEERR_RESC_DEPTH);
+      if (dirent == nullptr) {
+        delete rde;
+      }
+      return false;
+    } else if (depth == 0) {
       rde->type = rde->ID;
       if (i < rdt.NameEntries) {
         if (!parse_resource_id(
-                sectionData, rde->ID & 0x0FFFFFFF, rde->type_str)) {
+                ctx, sectionData, rde->ID & 0x0FFFFFFF, rde->type_str)) {
           if (dirent == nullptr) {
             delete rde;
           }
@@ -832,7 +990,7 @@ bool parse_resource_table(bounded_buffer *sectionData,
       rde->name = rde->ID;
       if (i < rdt.NameEntries) {
         if (!parse_resource_id(
-                sectionData, rde->ID & 0x0FFFFFFF, rde->name_str)) {
+                ctx, sectionData, rde->ID & 0x0FFFFFFF, rde->name_str)) {
           if (dirent == nullptr) {
             delete rde;
           }
@@ -843,28 +1001,20 @@ bool parse_resource_table(bounded_buffer *sectionData,
       rde->lang = rde->ID;
       if (i < rdt.NameEntries) {
         if (!parse_resource_id(
-                sectionData, rde->ID & 0x0FFFFFFF, rde->lang_str)) {
+                ctx, sectionData, rde->ID & 0x0FFFFFFF, rde->lang_str)) {
           if (dirent == nullptr) {
             delete rde;
           }
           return false;
         }
       }
-    } else {
-      /* .rsrc can accommodate up to 2**31 levels, but Windows only uses 3 by
-       * convention. As such, any depth above 3 indicates potentially unchecked
-       * recursion. See:
-       * https://docs.microsoft.com/en-us/windows/desktop/debug/pe-format#the-rsrc-section
-       */
-
-      PE_ERR(PEERR_RESC);
-      return false;
     }
 
     // High bit 0 = RVA to RDT.
     // High bit 1 = RVA to RDE.
     if (rde->RVA & 0x80000000) {
-      if (!parse_resource_table(sectionData,
+      if (!parse_resource_table(ctx,
+                                sectionData,
                                 rde->RVA & 0x0FFFFFFF,
                                 virtaddr,
                                 depth + 1,
@@ -887,40 +1037,40 @@ bool parse_resource_table(bounded_buffer *sectionData,
        * but meh.
        */
 
-      if (!readDword(sectionData,
-                     rde->RVA + offsetof(__typeof__(rdat), RVA),
-                     rdat.RVA)) {
-        PE_ERR(PEERR_READ);
+      if (!readResourceDword(ctx,
+                             sectionData,
+                             rde->RVA + offsetof(__typeof__(rdat), RVA),
+                             rdat.RVA)) {
         if (dirent == nullptr) {
           delete rde;
         }
         return false;
       }
 
-      if (!readDword(sectionData,
-                     rde->RVA + offsetof(__typeof__(rdat), size),
-                     rdat.size)) {
-        PE_ERR(PEERR_READ);
+      if (!readResourceDword(ctx,
+                             sectionData,
+                             rde->RVA + offsetof(__typeof__(rdat), size),
+                             rdat.size)) {
         if (dirent == nullptr) {
           delete rde;
         }
         return false;
       }
 
-      if (!readDword(sectionData,
-                     rde->RVA + offsetof(__typeof__(rdat), codepage),
-                     rdat.codepage)) {
-        PE_ERR(PEERR_READ);
+      if (!readResourceDword(ctx,
+                             sectionData,
+                             rde->RVA + offsetof(__typeof__(rdat), codepage),
+                             rdat.codepage)) {
         if (dirent == nullptr) {
           delete rde;
         }
         return false;
       }
 
-      if (!readDword(sectionData,
-                     rde->RVA + offsetof(__typeof__(rdat), reserved),
-                     rdat.reserved)) {
-        PE_ERR(PEERR_READ);
+      if (!readResourceDword(ctx,
+                             sectionData,
+                             rde->RVA + offsetof(__typeof__(rdat), reserved),
+                             rdat.reserved)) {
         if (dirent == nullptr) {
           delete rde;
         }
@@ -982,6 +1132,38 @@ bool parse_resource_table(bounded_buffer *sectionData,
   return true;
 }
 
+bool parse_resource_table(resource_parse_context &ctx,
+                          bounded_buffer *sectionData,
+                          std::uint32_t o,
+                          std::uint32_t virtaddr,
+                          std::uint32_t depth,
+                          resource_dir_entry *dirent,
+                          std::vector<resource> &rsrcs) {
+  if (sectionData == nullptr) {
+    return false;
+  }
+
+  // A table that references itself or one of its ancestors is a true cycle.
+  if (std::find(ctx.path.begin(), ctx.path.end(), o) != ctx.path.end()) {
+    PE_ERR(PEERR_RESC_CYCLE);
+    return false;
+  }
+
+  // A table that was already parsed through another path is a shared
+  // subtree. Its resources were collected the first time around, so it is
+  // safe (and much cheaper) to not descend into it again.
+  if (ctx.seen.find(o) != ctx.seen.end()) {
+    return true;
+  }
+  ctx.seen.insert(o);
+
+  ctx.path.push_back(o);
+  bool ok = parse_resource_table_impl(
+      ctx, sectionData, o, virtaddr, depth, dirent, rsrcs);
+  ctx.path.pop_back();
+  return ok;
+}
+
 bool getResources(bounded_buffer *b,
                   bounded_buffer *fileBegin,
                   const std::vector<section> secs,
@@ -996,8 +1178,11 @@ bool getResources(bounded_buffer *b,
       continue;
     }
 
+    resource_parse_context ctx;
+    ctx.limits = g_resourceParseLimits;
+
     if (!parse_resource_table(
-            s.sectionData, 0, s.sec.VirtualAddress, 0, nullptr, rsrcs)) {
+            ctx, s.sectionData, 0, s.sec.VirtualAddress, 0, nullptr, rsrcs)) {
       return false;
     }
 
@@ -2555,6 +2740,11 @@ bool getSymbolTable(parsed_pe *p) {
 }
 
 parsed_pe *ParsePEFromBuffer(bounded_buffer *buffer) {
+  // Reset the diagnostic state so that every parse reports a status that
+  // only depends on the buffer being parsed.
+  err = PEERR_NONE;
+  err_loc.clear();
+
   // First, create a new parsed_pe structure
   // We pass std::nothrow parameter to new so in case of failure it returns
   // nullptr instead of throwing exception std::bad_alloc.
@@ -2597,7 +2787,11 @@ parsed_pe *ParsePEFromBuffer(bounded_buffer *buffer) {
   if (!getResources(remaining, file, p->internal->secs, p->internal->rsrcs)) {
     deleteBuffer(remaining);
     DestructParsedPE(p);
-    PE_ERR(PEERR_RESC);
+    // Keep the specific error reported by the resource parser (depth, node
+    // count, cycle or read limit) when there is one.
+    if (err == PEERR_NONE) {
+      PE_ERR(PEERR_RESC);
+    }
     return nullptr;
   }
 

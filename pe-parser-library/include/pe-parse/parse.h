@@ -150,7 +150,34 @@ enum pe_err {
   PEERR_BUFFER = 10,
   PEERR_ADDRESS = 11,
   PEERR_SIZE = 12,
+  PEERR_RESC_DEPTH = 13,
+  PEERR_RESC_NODES = 14,
+  PEERR_RESC_CYCLE = 15,
+  PEERR_RESC_WORK = 16,
 };
+
+// Bounds applied while walking the resource directory tree. Traversal stops
+// with a dedicated error (PEERR_RESC_DEPTH, PEERR_RESC_NODES or
+// PEERR_RESC_WORK) as soon as any of these limits is exceeded. A directory
+// table that references one of its own ancestors is rejected with
+// PEERR_RESC_CYCLE, while a table that is merely shared between several
+// parents is parsed once and then skipped.
+struct resource_parse_limits {
+  // Maximum number of directory levels to descend. Windows uses three
+  // levels (type, name, language) by convention.
+  std::uint32_t maxDepth;
+  // Maximum number of directory entries to visit in total.
+  std::uint32_t maxNodes;
+  // Maximum number of bytes to read from the resource section while
+  // walking the directory tree.
+  std::uint64_t maxReadBytes;
+};
+
+// get the limits used when parsing resource directory trees
+resource_parse_limits GetResourceParseLimits();
+
+// set the limits used when parsing resource directory trees
+void SetResourceParseLimits(const resource_parse_limits &limits);
 
 bool readByte(bounded_buffer *b, std::uint32_t offset, std::uint8_t &out);
 bool readWord(bounded_buffer *b, std::uint32_t offset, std::uint16_t &out);
