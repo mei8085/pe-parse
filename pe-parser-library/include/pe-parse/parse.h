@@ -35,10 +35,18 @@ THE SOFTWARE.
 #define __typeof__(x) std::remove_reference<decltype(x)>::type
 #endif
 
+namespace peparse {
+struct PEDiagnostic;
+}
+
+// Legacy error-recording macro. It is retained for source compatibility:
+// code (including pe-parse itself) that records an error through PE_ERR keeps
+// compiling and keeps populating the legacy, thread-local error state that is
+// queried through GetPEErr(), GetPEErrString() and GetPEErrLoc(). New code
+// inside the parser uses the per-parse PEDiagnostic machinery instead.
 #define PE_ERR(x)               \
-  err = static_cast<pe_err>(x); \
-  err_loc.assign(__func__);     \
-  err_loc += ":" + to_string<std::uint32_t>(__LINE__, std::dec);
+  peparse::recordLegacyErr(     \
+      static_cast<peparse::pe_err>(x), __func__, __LINE__)
 
 #define READ_WORD(b, o, inst, member)                                          \
   if (!readWord(b,                                                             \
@@ -152,6 +160,97 @@ enum pe_err {
   PEERR_SIZE = 12,
 };
 
+// High-level phase of a ParsePEFrom* call. A failure always belongs to
+// exactly one stage, which lets callers distinguish e.g. a corrupt header
+// from a corrupt data directory without parsing source file locations.
+enum pe_parse_stage {
+  PE_STAGE_NONE = 0,
+  PE_STAGE_FILE_OPEN,
+  PE_STAGE_BUFFER,
+  PE_STAGE_DOS_HEADER,
+  PE_STAGE_RICH_HEADER,
+  PE_STAGE_NT_HEADERS,
+  PE_STAGE_SECTIONS,
+  PE_STAGE_RESOURCES,
+  PE_STAGE_EXPORTS,
+  PE_STAGE_RELOCATIONS,
+  PE_STAGE_DEBUG,
+  PE_STAGE_IMPORTS,
+  PE_STAGE_SYMBOL_TABLE,
+};
+
+// Structured diagnostic for a single ParsePEFrom* invocation.
+//
+// One PEDiagnostic instance is used by exactly one parse call: concurrent
+// parses on different threads and nested parses on the same thread each have
+// their own instance and never overwrite each other. The fields are reset to
+// their default values at the start of every parse call. Within a single
+// call each failure site overwrites the previous record, so an outer stage
+// can mask a low-level read error with a broader error code just like the
+// legacy GetPEErr() interface.
+//
+// Call contract:
+//   * On a successful parse the returned parsed_pe pointer is non-null and
+//     code == PEERR_NONE. All existing parsed_pe accessors keep their
+//     existing behavior.
+//   * On a failed parse the returned parsed_pe pointer is null and code holds
+//     the pe_err value recorded at the failure site, with the stage,
+//     directory (when the failure happened while processing a data
+//     directory) and offset (when associated with a concrete byte offset)
+//     filled in. An outer parse stage may re-record a broader error code over
+//     the low-level read error reported by a helper, matching the historical
+//     behavior of the GetPEErr() interface.
+//   * A PEDiagnostic is only meaningful for the parse call it was passed
+//     to. It must not be inspected through a parsed_pe object: a failed parse
+//     never produces a parsed_pe object, and a successful parse leaves the
+//     diagnostic at PEERR_NONE. Iterators and accessors (IterSec, ReadByteAtVA
+//     and friends) take a parsed_pe and never touch a PEDiagnostic. Passing
+//     nullptr is always valid; in that case the failure remains available
+//     through the legacy, thread-local GetPEErr*() interface on the calling
+//     thread.
+struct PEDiagnostic {
+  PEDiagnostic()
+      : code(PEERR_NONE),
+        stage(PE_STAGE_NONE),
+        directory(DIR_RESERVED),
+        directoryKnown(false),
+        offset(0),
+        offsetKnown(false) {
+  }
+
+  // pe_err value describing the kind of failure; PEERR_NONE while no failure
+  // has been recorded.
+  std::uint32_t code;
+
+  // Parser stage that was executing when the failure was recorded.
+  pe_parse_stage stage;
+
+  // Data directory being processed when the failure occurred, if any. Only
+  // valid when directoryKnown is true. DIR_RESERVED is used as the sentinel
+  // value otherwise.
+  data_directory_kind directory;
+  bool directoryKnown;
+
+  // Byte offset associated with the failure, relative to the buffer being
+  // read at the failure site (typically a section or header sub-buffer). Only
+  // valid when offsetKnown is true. It identifies where parsing failed, not
+  // necessarily the root cause of the malformation.
+  std::uint32_t offset;
+  bool offsetKnown;
+
+  // Legacy, human-readable "function:line" location of the failure site.
+  // Equivalent to the string returned by GetPEErrLoc() for this parse.
+  std::string functionLocation;
+};
+
+// Record a failure into the calling thread's legacy error state. Used by the
+// PE_ERR macro and to mirror per-parse diagnostics for the GetPEErr* API.
+void recordLegacyErr(pe_err x, const char *func, std::uint32_t line);
+
+// Stable, human-readable names for pe_parse_stage values. Never returns
+// nullptr; unknown values map to "Unknown".
+const char *PEParseStageToString(pe_parse_stage stage);
+
 bool readByte(bounded_buffer *b, std::uint32_t offset, std::uint8_t &out);
 bool readWord(bounded_buffer *b, std::uint32_t offset, std::uint16_t &out);
 bool readDword(bounded_buffer *b, std::uint32_t offset, std::uint32_t &out);
@@ -188,6 +287,13 @@ const std::string &GetRichObjectType(std::uint16_t prodId);
 const std::string &GetRichProductName(std::uint16_t buildNum);
 
 // get parser error status as integer
+//
+// Legacy error query interface. These report the most recent failure of a
+// ParsePEFrom* call on the *calling thread*: the underlying state is
+// thread-local, so concurrent parses on different threads no longer
+// interfere with each other. A nested parse on the same thread still updates
+// this shared thread state, so code that needs fully isolated diagnostics
+// must pass an explicit PEDiagnostic to the ParsePEFrom* entry points.
 std::uint32_t GetPEErr();
 
 // get parser error status as string
@@ -201,6 +307,32 @@ parsed_pe *ParsePEFromFile(const char *filePath);
 
 parsed_pe *ParsePEFromPointer(std::uint8_t *buffer, std::uint32_t sz);
 parsed_pe *ParsePEFromBuffer(bounded_buffer *buffer);
+
+// Per-parse, isolated variants of the entry points above. When diagnostic
+// is non-null it is reset at the start of the call and populated with
+// structured failure information (see PEDiagnostic for the call contract).
+// A nullptr diagnostic is valid and yields the legacy behavior, with the
+// failure still queryable through GetPEErr*() on the calling thread.
+//
+// Ownership and the no-object contract:
+//   * On success the returned parsed_pe owns the input (the file mapping or
+//     the bounded_buffer) and releases it in DestructParsedPE.
+//   * On failure these functions always return nullptr: no parsed_pe object
+//     is formed, so there is nothing to pass to DestructParsedPE and nothing
+//     through which to query a diagnostic. The failure is observable only
+//     via the out-parameter PEDiagnostic (when supplied) or the
+//     thread-local GetPEErr*() accessors. ParsePEFromBuffer additionally
+//     consumes and releases the bounded_buffer on failure, so the caller
+//     must not call deleteBuffer on it after a nullptr result.
+//   * ParsePEFromFile and ParsePEFromPointer own their intermediate buffer
+//     entirely; callers only keep ownership of the raw pointer passed to
+//     ParsePEFromPointer, which is never freed by the parser.
+parsed_pe *ParsePEFromFile(const char *filePath, PEDiagnostic *diagnostic);
+parsed_pe *ParsePEFromPointer(std::uint8_t *buffer,
+                              std::uint32_t sz,
+                              PEDiagnostic *diagnostic);
+parsed_pe *ParsePEFromBuffer(bounded_buffer *buffer,
+                             PEDiagnostic *diagnostic);
 
 // destruct a PE context
 void DestructParsedPE(parsed_pe *p);

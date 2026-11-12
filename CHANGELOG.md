@@ -9,6 +9,30 @@ All versions prior to [2.0.0] are untracked.
 
 ## [Unreleased]
 
+### Added
+
+- Added per-parse, structured diagnostics (`PEDiagnostic`) to the
+  `ParsePEFromFile`, `ParsePEFromPointer`, and `ParsePEFromBuffer` entry
+  points via an optional out-parameter. A failed parse now reports a stable
+  error code together with the failing parser stage, the data directory being
+  processed (when applicable), and the failing byte offset (when known).
+- Added `PEParseStageToString()` for stable, human-readable parser stage
+  names.
+
+### Changed
+
+- Parse diagnostics are now isolated per call: concurrent parses on
+  different threads and nested parses on the same thread no longer overwrite
+  each other's failure information.
+- The legacy `GetPEErr()`, `GetPEErrString()`, and `GetPEErrLoc()` error
+  query interface is preserved and is now thread-local instead of
+  process-global. The legacy `PE_ERR` and `READ_*` macros are retained for
+  source compatibility.
+- Documented the no-object call contract: a failed parse always returns
+  `nullptr` (no `parsed_pe` object is formed), with the failure observable
+  through the out-parameter diagnostic or the thread-local accessors, and
+  `ParsePEFromBuffer` consumes the input buffer on failure.
+
 ## [3.0.0-rc.1] - 2026-05-22
 
 ### Added

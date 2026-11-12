@@ -29,10 +29,14 @@ the PE file. This should help in constructing a sane parser that allows for dete
 of bogus values in the PE that would result in out of bounds accesses of the input buffer.
 Once data is read from the file it is sanitized and placed in C++ STL containers of internal types.
 
-> [!WARNING]
-> pe-parse's error handling is not thread safe. If you want to perform PE
-> writes/parses in multiple threads, you **must** independently synchronize
-> your operations.
+> [!NOTE]
+> Each `ParsePEFrom*` call produces an isolated, structured `PEDiagnostic`
+> (passed via the optional out-parameter) that is safe under concurrent and
+> nested parses: separate calls never overwrite each other's diagnostics. The
+> legacy `GetPEErr()`/`GetPEErrString()`/`GetPEErrLoc()` accessors are
+> thread-local, so they report the most recent failure of the calling thread
+> only; code that needs fully isolated failure information should pass an
+> explicit `PEDiagnostic` instead of relying on the thread-local accessors.
 
 ## Installation
 

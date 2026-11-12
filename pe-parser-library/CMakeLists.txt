@@ -10,6 +10,7 @@ list(APPEND PEPARSERLIB_SOURCEFILES
   include/pe-parse/to_string.h
 
   src/buffer.cpp
+  src/diagnostic.h
   src/parse.cpp
 )
 

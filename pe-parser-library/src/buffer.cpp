@@ -28,6 +28,8 @@ THE SOFTWARE.
 // keep this header above "windows.h" because it contains many types
 #include <pe-parse/parse.h>
 
+#include "diagnostic.h"
+
 #ifdef _WIN32
 
 #define WIN32_LEAN_AND_MEAN
@@ -89,8 +91,14 @@ peparse::bounded_buffer *makeBufferView(peparse::bounded_buffer *b,
 
 namespace peparse {
 
-extern std::uint32_t err;
-extern std::string err_loc;
+// The diagnostic of the ParsePEFrom* call currently executing on this
+// thread, or nullptr when no parse is in flight. The low-level bounded
+// buffer readers use it to record the concrete failing offset; ownership
+// stays with the ParsePEFrom* entry point.
+thread_local PEDiagnostic *active_diagnostic = nullptr;
+
+thread_local std::uint32_t tls_err = PEERR_NONE;
+thread_local std::string tls_err_loc;
 
 struct buffer_detail {
 #ifdef _WIN32
@@ -108,7 +116,11 @@ bool readByte(bounded_buffer *b, std::uint32_t offset, std::uint8_t &out) {
   }
 
   if (offset >= b->bufLen) {
-    PE_ERR(PEERR_ADDRESS);
+    if (active_diagnostic != nullptr) {
+      PE_DIAG_AT(PEERR_ADDRESS, *active_diagnostic, offset);
+    } else {
+      PE_ERR(PEERR_ADDRESS);
+    }
     return false;
   }
 
@@ -125,7 +137,11 @@ bool readWord(bounded_buffer *b, std::uint32_t offset, std::uint16_t &out) {
   }
 
   if (static_cast<std::uint64_t>(offset) + 1 >= b->bufLen) {
-    PE_ERR(PEERR_ADDRESS);
+    if (active_diagnostic != nullptr) {
+      PE_DIAG_AT(PEERR_ADDRESS, *active_diagnostic, offset);
+    } else {
+      PE_ERR(PEERR_ADDRESS);
+    }
     return false;
   }
 
@@ -147,7 +163,11 @@ bool readDword(bounded_buffer *b, std::uint32_t offset, std::uint32_t &out) {
   }
 
   if (static_cast<std::uint64_t>(offset) + 3 >= b->bufLen) {
-    PE_ERR(PEERR_ADDRESS);
+    if (active_diagnostic != nullptr) {
+      PE_DIAG_AT(PEERR_ADDRESS, *active_diagnostic, offset);
+    } else {
+      PE_ERR(PEERR_ADDRESS);
+    }
     return false;
   }
 
@@ -169,7 +189,11 @@ bool readQword(bounded_buffer *b, std::uint32_t offset, std::uint64_t &out) {
   }
 
   if (static_cast<std::uint64_t>(offset) + 7 >= b->bufLen) {
-    PE_ERR(PEERR_ADDRESS);
+    if (active_diagnostic != nullptr) {
+      PE_DIAG_AT(PEERR_ADDRESS, *active_diagnostic, offset);
+    } else {
+      PE_ERR(PEERR_ADDRESS);
+    }
     return false;
   }
 
@@ -191,7 +215,11 @@ bool readChar16(bounded_buffer *b, std::uint32_t offset, char16_t &out) {
   }
 
   if (static_cast<std::uint64_t>(offset) + 1 >= b->bufLen) {
-    PE_ERR(PEERR_ADDRESS);
+    if (active_diagnostic != nullptr) {
+      PE_DIAG_AT(PEERR_ADDRESS, *active_diagnostic, offset);
+    } else {
+      PE_ERR(PEERR_ADDRESS);
+    }
     return false;
   }
 

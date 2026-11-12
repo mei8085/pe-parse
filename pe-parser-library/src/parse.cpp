@@ -35,6 +35,8 @@ THE SOFTWARE.
 #include <pe-parse/parse.h>
 #include <pe-parse/to_string.h>
 
+#include "diagnostic.h"
+
 namespace peparse {
 
 struct section {
@@ -495,9 +497,6 @@ const std::string &GetRichProductName(std::uint16_t buildNum) {
   }
 }
 
-std::uint32_t err = 0;
-std::string err_loc;
-
 static const char *pe_err_str[] = {
     "None",
     "Out of memory",
@@ -514,16 +513,70 @@ static const char *pe_err_str[] = {
     "Invalid size",
 };
 
+void recordLegacyErr(pe_err x, const char *func, std::uint32_t line) {
+  tls_err = static_cast<std::uint32_t>(x);
+  tls_err_loc.assign(func);
+  tls_err_loc += ":";
+  tls_err_loc += to_string<std::uint32_t>(line, std::dec);
+
+  // If a parse is in flight on this thread, keep its diagnostic in sync so
+  // that failure sites reached only through the legacy macro (e.g. the
+  // bounded buffer layer or readFileToFileBuffer) are still reflected there.
+  if (active_diagnostic != nullptr) {
+    active_diagnostic->code = tls_err;
+    active_diagnostic->functionLocation = tls_err_loc;
+  }
+}
+
+const char *PEParseStageToString(pe_parse_stage stage) {
+  switch (stage) {
+  case PE_STAGE_NONE:
+    return "None";
+  case PE_STAGE_FILE_OPEN:
+    return "FileOpen";
+  case PE_STAGE_BUFFER:
+    return "Buffer";
+  case PE_STAGE_DOS_HEADER:
+    return "DOSHeader";
+  case PE_STAGE_RICH_HEADER:
+    return "RichHeader";
+  case PE_STAGE_NT_HEADERS:
+    return "NTHeaders";
+  case PE_STAGE_SECTIONS:
+    return "Sections";
+  case PE_STAGE_RESOURCES:
+    return "Resources";
+  case PE_STAGE_EXPORTS:
+    return "Exports";
+  case PE_STAGE_RELOCATIONS:
+    return "Relocations";
+  case PE_STAGE_DEBUG:
+    return "Debug";
+  case PE_STAGE_IMPORTS:
+    return "Imports";
+  case PE_STAGE_SYMBOL_TABLE:
+    return "SymbolTable";
+  default:
+    return "Unknown";
+  }
+
+  return "Unknown";
+}
+
 std::uint32_t GetPEErr() {
-  return err;
+  return tls_err;
 }
 
 std::string GetPEErrString() {
-  return pe_err_str[err];
+  if (tls_err >=
+      sizeof(pe_err_str) / sizeof(pe_err_str[0])) {
+    return "Unknown";
+  }
+  return pe_err_str[tls_err];
 }
 
 std::string GetPEErrLoc() {
-  return err_loc;
+  return tls_err_loc;
 }
 
 const char *GetSymbolTableStorageClassName(std::uint8_t id) {
@@ -744,9 +797,11 @@ void IterRsrc(parsed_pe *pe, iterRsrc cb, void *cbd) {
 
 bool parse_resource_id(bounded_buffer *data,
                        std::uint32_t id,
-                       std::string &result) {
+                       std::string &result,
+                       PEDiagnostic &diag) {
   std::uint16_t len;
   if (!readWord(data, id, len)) {
+    PE_DIAG_AT(PEERR_READ, diag, id);
     return false;
   }
   id += 2;
@@ -756,6 +811,7 @@ bool parse_resource_id(bounded_buffer *data,
   for (std::uint32_t i = 0; i < rawSize; i += 2) {
     char16_t c;
     if (!readChar16(data, id + i, c)) {
+      PE_DIAG_AT(PEERR_READ, diag, id + i);
       return false;
     }
     rawString.push_back(c);
@@ -770,19 +826,21 @@ bool parse_resource_table(bounded_buffer *sectionData,
                           std::uint32_t virtaddr,
                           std::uint32_t depth,
                           resource_dir_entry *dirent,
-                          std::vector<resource> &rsrcs) {
+                          std::vector<resource> &rsrcs,
+                          PEDiagnostic &diag) {
   resource_dir_table rdt;
 
   if (sectionData == nullptr) {
+    PE_DIAG(PEERR_BUFFER, diag);
     return false;
   }
 
-  READ_DWORD(sectionData, o, rdt, Characteristics);
-  READ_DWORD(sectionData, o, rdt, TimeDateStamp);
-  READ_WORD(sectionData, o, rdt, MajorVersion);
-  READ_WORD(sectionData, o, rdt, MinorVersion);
-  READ_WORD(sectionData, o, rdt, NameEntries);
-  READ_WORD(sectionData, o, rdt, IDEntries);
+  READ_DWORD_DIAG(sectionData, o, rdt, Characteristics, diag);
+  READ_DWORD_DIAG(sectionData, o, rdt, TimeDateStamp, diag);
+  READ_WORD_DIAG(sectionData, o, rdt, MajorVersion, diag);
+  READ_WORD_DIAG(sectionData, o, rdt, MinorVersion, diag);
+  READ_WORD_DIAG(sectionData, o, rdt, NameEntries, diag);
+  READ_WORD_DIAG(sectionData, o, rdt, IDEntries, diag);
 
   o += sizeof(resource_dir_table);
 
@@ -799,7 +857,8 @@ bool parse_resource_table(bounded_buffer *sectionData,
     }
 
     if (!readDword(sectionData, o + offsetof(__typeof__(*rde), ID), rde->ID)) {
-      PE_ERR(PEERR_READ);
+      PE_DIAG_AT(PEERR_READ, diag,
+                 o + offsetof(__typeof__(*rde), ID));
       if (dirent == nullptr) {
         delete rde;
       }
@@ -808,7 +867,8 @@ bool parse_resource_table(bounded_buffer *sectionData,
 
     if (!readDword(
             sectionData, o + offsetof(__typeof__(*rde), RVA), rde->RVA)) {
-      PE_ERR(PEERR_READ);
+      PE_DIAG_AT(PEERR_READ, diag,
+                 o + offsetof(__typeof__(*rde), RVA));
       if (dirent == nullptr) {
         delete rde;
       }
@@ -821,7 +881,7 @@ bool parse_resource_table(bounded_buffer *sectionData,
       rde->type = rde->ID;
       if (i < rdt.NameEntries) {
         if (!parse_resource_id(
-                sectionData, rde->ID & 0x0FFFFFFF, rde->type_str)) {
+                sectionData, rde->ID & 0x0FFFFFFF, rde->type_str, diag)) {
           if (dirent == nullptr) {
             delete rde;
           }
@@ -832,7 +892,7 @@ bool parse_resource_table(bounded_buffer *sectionData,
       rde->name = rde->ID;
       if (i < rdt.NameEntries) {
         if (!parse_resource_id(
-                sectionData, rde->ID & 0x0FFFFFFF, rde->name_str)) {
+                sectionData, rde->ID & 0x0FFFFFFF, rde->name_str, diag)) {
           if (dirent == nullptr) {
             delete rde;
           }
@@ -843,7 +903,7 @@ bool parse_resource_table(bounded_buffer *sectionData,
       rde->lang = rde->ID;
       if (i < rdt.NameEntries) {
         if (!parse_resource_id(
-                sectionData, rde->ID & 0x0FFFFFFF, rde->lang_str)) {
+                sectionData, rde->ID & 0x0FFFFFFF, rde->lang_str, diag)) {
           if (dirent == nullptr) {
             delete rde;
           }
@@ -857,7 +917,7 @@ bool parse_resource_table(bounded_buffer *sectionData,
        * https://docs.microsoft.com/en-us/windows/desktop/debug/pe-format#the-rsrc-section
        */
 
-      PE_ERR(PEERR_RESC);
+      PE_DIAG(PEERR_RESC, diag);
       return false;
     }
 
@@ -869,7 +929,8 @@ bool parse_resource_table(bounded_buffer *sectionData,
                                 virtaddr,
                                 depth + 1,
                                 rde,
-                                rsrcs)) {
+                                rsrcs,
+                                diag)) {
         if (dirent == nullptr) {
           delete rde;
         }
@@ -890,7 +951,8 @@ bool parse_resource_table(bounded_buffer *sectionData,
       if (!readDword(sectionData,
                      rde->RVA + offsetof(__typeof__(rdat), RVA),
                      rdat.RVA)) {
-        PE_ERR(PEERR_READ);
+        PE_DIAG_AT(PEERR_READ, diag,
+                   rde->RVA + offsetof(__typeof__(rdat), RVA));
         if (dirent == nullptr) {
           delete rde;
         }
@@ -900,7 +962,8 @@ bool parse_resource_table(bounded_buffer *sectionData,
       if (!readDword(sectionData,
                      rde->RVA + offsetof(__typeof__(rdat), size),
                      rdat.size)) {
-        PE_ERR(PEERR_READ);
+        PE_DIAG_AT(PEERR_READ, diag,
+                   rde->RVA + offsetof(__typeof__(rdat), size));
         if (dirent == nullptr) {
           delete rde;
         }
@@ -910,7 +973,8 @@ bool parse_resource_table(bounded_buffer *sectionData,
       if (!readDword(sectionData,
                      rde->RVA + offsetof(__typeof__(rdat), codepage),
                      rdat.codepage)) {
-        PE_ERR(PEERR_READ);
+        PE_DIAG_AT(PEERR_READ, diag,
+                   rde->RVA + offsetof(__typeof__(rdat), codepage));
         if (dirent == nullptr) {
           delete rde;
         }
@@ -920,7 +984,8 @@ bool parse_resource_table(bounded_buffer *sectionData,
       if (!readDword(sectionData,
                      rde->RVA + offsetof(__typeof__(rdat), reserved),
                      rdat.reserved)) {
-        PE_ERR(PEERR_READ);
+        PE_DIAG_AT(PEERR_READ, diag,
+                   rde->RVA + offsetof(__typeof__(rdat), reserved));
         if (dirent == nullptr) {
           delete rde;
         }
@@ -985,11 +1050,15 @@ bool parse_resource_table(bounded_buffer *sectionData,
 bool getResources(bounded_buffer *b,
                   bounded_buffer *fileBegin,
                   const std::vector<section> secs,
-                  std::vector<resource> &rsrcs) {
+                  std::vector<resource> &rsrcs,
+                  PEDiagnostic &diag) {
   static_cast<void>(fileBegin);
 
   if (b == nullptr)
+  {
+    PE_DIAG(PEERR_BUFFER, diag);
     return false;
+  }
 
   for (section s : secs) {
     if (s.sectionName != ".rsrc") {
@@ -997,7 +1066,8 @@ bool getResources(bounded_buffer *b,
     }
 
     if (!parse_resource_table(
-            s.sectionData, 0, s.sec.VirtualAddress, 0, nullptr, rsrcs)) {
+            s.sectionData, 0, s.sec.VirtualAddress, 0, nullptr, rsrcs,
+            diag)) {
       return false;
     }
 
@@ -1010,8 +1080,10 @@ bool getResources(bounded_buffer *b,
 bool getSections(bounded_buffer *b,
                  bounded_buffer *fileBegin,
                  nt_header_32 &nthdr,
-                 std::vector<section> &secs) {
+                 std::vector<section> &secs,
+                 PEDiagnostic &diag) {
   if (b == nullptr) {
+    PE_DIAG(PEERR_BUFFER, diag);
     return false;
   }
 
@@ -1022,19 +1094,20 @@ bool getSections(bounded_buffer *b,
     std::uint32_t o = i * sizeof(image_section_header);
     for (std::uint32_t k = 0; k < NT_SHORT_NAME_LEN; k++) {
       if (!readByte(b, o + k, curSec.Name[k])) {
+        PE_DIAG_AT(PEERR_READ, diag, o + k);
         return false;
       }
     }
 
-    READ_DWORD(b, o, curSec, Misc.VirtualSize);
-    READ_DWORD(b, o, curSec, VirtualAddress);
-    READ_DWORD(b, o, curSec, SizeOfRawData);
-    READ_DWORD(b, o, curSec, PointerToRawData);
-    READ_DWORD(b, o, curSec, PointerToRelocations);
-    READ_DWORD(b, o, curSec, PointerToLinenumbers);
-    READ_WORD(b, o, curSec, NumberOfRelocations);
-    READ_WORD(b, o, curSec, NumberOfLinenumbers);
-    READ_DWORD(b, o, curSec, Characteristics);
+    READ_DWORD_DIAG(b, o, curSec, Misc.VirtualSize, diag);
+    READ_DWORD_DIAG(b, o, curSec, VirtualAddress, diag);
+    READ_DWORD_DIAG(b, o, curSec, SizeOfRawData, diag);
+    READ_DWORD_DIAG(b, o, curSec, PointerToRawData, diag);
+    READ_DWORD_DIAG(b, o, curSec, PointerToRelocations, diag);
+    READ_DWORD_DIAG(b, o, curSec, PointerToLinenumbers, diag);
+    READ_WORD_DIAG(b, o, curSec, NumberOfRelocations, diag);
+    READ_WORD_DIAG(b, o, curSec, NumberOfLinenumbers, diag);
+    READ_DWORD_DIAG(b, o, curSec, Characteristics, diag);
 
     // now we have the section header information, so fill in a section
     // object appropriately
@@ -1056,7 +1129,7 @@ bool getSections(bounded_buffer *b,
       thisSec.sectionBase =
           nthdr.OptionalHeader64.ImageBase + curSec.VirtualAddress;
     } else {
-      PE_ERR(PEERR_MAGIC);
+      PE_DIAG(PEERR_MAGIC, diag);
     }
 
     thisSec.sec = curSec;
@@ -1068,6 +1141,7 @@ bool getSections(bounded_buffer *b,
     // splitBufferByLength correctly handles this, but we failed to check for
     // the nullptr it returns as a sentinel.
     if (thisSec.sectionData == nullptr) {
+      PE_DIAG_AT(PEERR_ADDRESS, diag, curSec.PointerToRawData);
       return false;
     }
 
@@ -1082,38 +1156,40 @@ bool getSections(bounded_buffer *b,
   return true;
 }
 
-bool readOptionalHeader(bounded_buffer *b, optional_header_32 &header) {
-  READ_WORD(b, 0, header, Magic);
+bool readOptionalHeader(bounded_buffer *b,
+                        optional_header_32 &header,
+                        PEDiagnostic &diag) {
+  READ_WORD_DIAG(b, 0, header, Magic, diag);
 
-  READ_BYTE(b, 0, header, MajorLinkerVersion);
-  READ_BYTE(b, 0, header, MinorLinkerVersion);
-  READ_DWORD(b, 0, header, SizeOfCode);
-  READ_DWORD(b, 0, header, SizeOfInitializedData);
-  READ_DWORD(b, 0, header, SizeOfUninitializedData);
-  READ_DWORD(b, 0, header, AddressOfEntryPoint);
-  READ_DWORD(b, 0, header, BaseOfCode);
-  READ_DWORD(b, 0, header, BaseOfData);
-  READ_DWORD(b, 0, header, ImageBase);
-  READ_DWORD(b, 0, header, SectionAlignment);
-  READ_DWORD(b, 0, header, FileAlignment);
-  READ_WORD(b, 0, header, MajorOperatingSystemVersion);
-  READ_WORD(b, 0, header, MinorOperatingSystemVersion);
-  READ_WORD(b, 0, header, MajorImageVersion);
-  READ_WORD(b, 0, header, MinorImageVersion);
-  READ_WORD(b, 0, header, MajorSubsystemVersion);
-  READ_WORD(b, 0, header, MinorSubsystemVersion);
-  READ_DWORD(b, 0, header, Win32VersionValue);
-  READ_DWORD(b, 0, header, SizeOfImage);
-  READ_DWORD(b, 0, header, SizeOfHeaders);
-  READ_DWORD(b, 0, header, CheckSum);
-  READ_WORD(b, 0, header, Subsystem);
-  READ_WORD(b, 0, header, DllCharacteristics);
-  READ_DWORD(b, 0, header, SizeOfStackReserve);
-  READ_DWORD(b, 0, header, SizeOfStackCommit);
-  READ_DWORD(b, 0, header, SizeOfHeapReserve);
-  READ_DWORD(b, 0, header, SizeOfHeapCommit);
-  READ_DWORD(b, 0, header, LoaderFlags);
-  READ_DWORD(b, 0, header, NumberOfRvaAndSizes);
+  READ_BYTE_DIAG(b, 0, header, MajorLinkerVersion, diag);
+  READ_BYTE_DIAG(b, 0, header, MinorLinkerVersion, diag);
+  READ_DWORD_DIAG(b, 0, header, SizeOfCode, diag);
+  READ_DWORD_DIAG(b, 0, header, SizeOfInitializedData, diag);
+  READ_DWORD_DIAG(b, 0, header, SizeOfUninitializedData, diag);
+  READ_DWORD_DIAG(b, 0, header, AddressOfEntryPoint, diag);
+  READ_DWORD_DIAG(b, 0, header, BaseOfCode, diag);
+  READ_DWORD_DIAG(b, 0, header, BaseOfData, diag);
+  READ_DWORD_DIAG(b, 0, header, ImageBase, diag);
+  READ_DWORD_DIAG(b, 0, header, SectionAlignment, diag);
+  READ_DWORD_DIAG(b, 0, header, FileAlignment, diag);
+  READ_WORD_DIAG(b, 0, header, MajorOperatingSystemVersion, diag);
+  READ_WORD_DIAG(b, 0, header, MinorOperatingSystemVersion, diag);
+  READ_WORD_DIAG(b, 0, header, MajorImageVersion, diag);
+  READ_WORD_DIAG(b, 0, header, MinorImageVersion, diag);
+  READ_WORD_DIAG(b, 0, header, MajorSubsystemVersion, diag);
+  READ_WORD_DIAG(b, 0, header, MinorSubsystemVersion, diag);
+  READ_DWORD_DIAG(b, 0, header, Win32VersionValue, diag);
+  READ_DWORD_DIAG(b, 0, header, SizeOfImage, diag);
+  READ_DWORD_DIAG(b, 0, header, SizeOfHeaders, diag);
+  READ_DWORD_DIAG(b, 0, header, CheckSum, diag);
+  READ_WORD_DIAG(b, 0, header, Subsystem, diag);
+  READ_WORD_DIAG(b, 0, header, DllCharacteristics, diag);
+  READ_DWORD_DIAG(b, 0, header, SizeOfStackReserve, diag);
+  READ_DWORD_DIAG(b, 0, header, SizeOfStackCommit, diag);
+  READ_DWORD_DIAG(b, 0, header, SizeOfHeapReserve, diag);
+  READ_DWORD_DIAG(b, 0, header, SizeOfHeapCommit, diag);
+  READ_DWORD_DIAG(b, 0, header, LoaderFlags, diag);
+  READ_DWORD_DIAG(b, 0, header, NumberOfRvaAndSizes, diag);
 
   if (header.NumberOfRvaAndSizes > NUM_DIR_ENTRIES) {
     header.NumberOfRvaAndSizes = NUM_DIR_ENTRIES;
@@ -1126,11 +1202,13 @@ bool readOptionalHeader(bounded_buffer *b, optional_header_32 &header) {
 
     o = c + offsetof(data_directory, VirtualAddress);
     if (!readDword(b, o, header.DataDirectory[i].VirtualAddress)) {
+      PE_DIAG_AT(PEERR_READ, diag, o);
       return false;
     }
 
     o = c + offsetof(data_directory, Size);
     if (!readDword(b, o, header.DataDirectory[i].Size)) {
+      PE_DIAG_AT(PEERR_READ, diag, o);
       return false;
     }
   }
@@ -1138,37 +1216,39 @@ bool readOptionalHeader(bounded_buffer *b, optional_header_32 &header) {
   return true;
 }
 
-bool readOptionalHeader64(bounded_buffer *b, optional_header_64 &header) {
-  READ_WORD(b, 0, header, Magic);
+bool readOptionalHeader64(bounded_buffer *b,
+                          optional_header_64 &header,
+                          PEDiagnostic &diag) {
+  READ_WORD_DIAG(b, 0, header, Magic, diag);
 
-  READ_BYTE(b, 0, header, MajorLinkerVersion);
-  READ_BYTE(b, 0, header, MinorLinkerVersion);
-  READ_DWORD(b, 0, header, SizeOfCode);
-  READ_DWORD(b, 0, header, SizeOfInitializedData);
-  READ_DWORD(b, 0, header, SizeOfUninitializedData);
-  READ_DWORD(b, 0, header, AddressOfEntryPoint);
-  READ_DWORD(b, 0, header, BaseOfCode);
-  READ_QWORD(b, 0, header, ImageBase);
-  READ_DWORD(b, 0, header, SectionAlignment);
-  READ_DWORD(b, 0, header, FileAlignment);
-  READ_WORD(b, 0, header, MajorOperatingSystemVersion);
-  READ_WORD(b, 0, header, MinorOperatingSystemVersion);
-  READ_WORD(b, 0, header, MajorImageVersion);
-  READ_WORD(b, 0, header, MinorImageVersion);
-  READ_WORD(b, 0, header, MajorSubsystemVersion);
-  READ_WORD(b, 0, header, MinorSubsystemVersion);
-  READ_DWORD(b, 0, header, Win32VersionValue);
-  READ_DWORD(b, 0, header, SizeOfImage);
-  READ_DWORD(b, 0, header, SizeOfHeaders);
-  READ_DWORD(b, 0, header, CheckSum);
-  READ_WORD(b, 0, header, Subsystem);
-  READ_WORD(b, 0, header, DllCharacteristics);
-  READ_QWORD(b, 0, header, SizeOfStackReserve);
-  READ_QWORD(b, 0, header, SizeOfStackCommit);
-  READ_QWORD(b, 0, header, SizeOfHeapReserve);
-  READ_QWORD(b, 0, header, SizeOfHeapCommit);
-  READ_DWORD(b, 0, header, LoaderFlags);
-  READ_DWORD(b, 0, header, NumberOfRvaAndSizes);
+  READ_BYTE_DIAG(b, 0, header, MajorLinkerVersion, diag);
+  READ_BYTE_DIAG(b, 0, header, MinorLinkerVersion, diag);
+  READ_DWORD_DIAG(b, 0, header, SizeOfCode, diag);
+  READ_DWORD_DIAG(b, 0, header, SizeOfInitializedData, diag);
+  READ_DWORD_DIAG(b, 0, header, SizeOfUninitializedData, diag);
+  READ_DWORD_DIAG(b, 0, header, AddressOfEntryPoint, diag);
+  READ_DWORD_DIAG(b, 0, header, BaseOfCode, diag);
+  READ_QWORD_DIAG(b, 0, header, ImageBase, diag);
+  READ_DWORD_DIAG(b, 0, header, SectionAlignment, diag);
+  READ_DWORD_DIAG(b, 0, header, FileAlignment, diag);
+  READ_WORD_DIAG(b, 0, header, MajorOperatingSystemVersion, diag);
+  READ_WORD_DIAG(b, 0, header, MinorOperatingSystemVersion, diag);
+  READ_WORD_DIAG(b, 0, header, MajorImageVersion, diag);
+  READ_WORD_DIAG(b, 0, header, MinorImageVersion, diag);
+  READ_WORD_DIAG(b, 0, header, MajorSubsystemVersion, diag);
+  READ_WORD_DIAG(b, 0, header, MinorSubsystemVersion, diag);
+  READ_DWORD_DIAG(b, 0, header, Win32VersionValue, diag);
+  READ_DWORD_DIAG(b, 0, header, SizeOfImage, diag);
+  READ_DWORD_DIAG(b, 0, header, SizeOfHeaders, diag);
+  READ_DWORD_DIAG(b, 0, header, CheckSum, diag);
+  READ_WORD_DIAG(b, 0, header, Subsystem, diag);
+  READ_WORD_DIAG(b, 0, header, DllCharacteristics, diag);
+  READ_QWORD_DIAG(b, 0, header, SizeOfStackReserve, diag);
+  READ_QWORD_DIAG(b, 0, header, SizeOfStackCommit, diag);
+  READ_QWORD_DIAG(b, 0, header, SizeOfHeapReserve, diag);
+  READ_QWORD_DIAG(b, 0, header, SizeOfHeapCommit, diag);
+  READ_DWORD_DIAG(b, 0, header, LoaderFlags, diag);
+  READ_DWORD_DIAG(b, 0, header, NumberOfRvaAndSizes, diag);
 
   if (header.NumberOfRvaAndSizes > NUM_DIR_ENTRIES) {
     header.NumberOfRvaAndSizes = NUM_DIR_ENTRIES;
@@ -1181,11 +1261,13 @@ bool readOptionalHeader64(bounded_buffer *b, optional_header_64 &header) {
 
     o = c + offsetof(data_directory, VirtualAddress);
     if (!readDword(b, o, header.DataDirectory[i].VirtualAddress)) {
+      PE_DIAG_AT(PEERR_READ, diag, o);
       return false;
     }
 
     o = c + offsetof(data_directory, Size);
     if (!readDword(b, o, header.DataDirectory[i].Size)) {
+      PE_DIAG_AT(PEERR_READ, diag, o);
       return false;
     }
   }
@@ -1193,27 +1275,32 @@ bool readOptionalHeader64(bounded_buffer *b, optional_header_64 &header) {
   return true;
 }
 
-bool readFileHeader(bounded_buffer *b, file_header &header) {
-  READ_WORD(b, 0, header, Machine);
-  READ_WORD(b, 0, header, NumberOfSections);
-  READ_DWORD(b, 0, header, TimeDateStamp);
-  READ_DWORD(b, 0, header, PointerToSymbolTable);
-  READ_DWORD(b, 0, header, NumberOfSymbols);
-  READ_WORD(b, 0, header, SizeOfOptionalHeader);
-  READ_WORD(b, 0, header, Characteristics);
+bool readFileHeader(bounded_buffer *b,
+                    file_header &header,
+                    PEDiagnostic &diag) {
+  READ_WORD_DIAG(b, 0, header, Machine, diag);
+  READ_WORD_DIAG(b, 0, header, NumberOfSections, diag);
+  READ_DWORD_DIAG(b, 0, header, TimeDateStamp, diag);
+  READ_DWORD_DIAG(b, 0, header, PointerToSymbolTable, diag);
+  READ_DWORD_DIAG(b, 0, header, NumberOfSymbols, diag);
+  READ_WORD_DIAG(b, 0, header, SizeOfOptionalHeader, diag);
+  READ_WORD_DIAG(b, 0, header, Characteristics, diag);
 
   return true;
 }
 
-bool readNtHeader(bounded_buffer *b, nt_header_32 &header) {
+bool readNtHeader(bounded_buffer *b,
+                  nt_header_32 &header,
+                  PEDiagnostic &diag) {
   if (b == nullptr) {
+    PE_DIAG(PEERR_BUFFER, diag);
     return false;
   }
 
   std::uint32_t pe_magic;
   std::uint32_t curOffset = 0;
   if (!readDword(b, curOffset, pe_magic) || pe_magic != NT_MAGIC) {
-    PE_ERR(PEERR_READ);
+    PE_DIAG_AT(PEERR_READ, diag, curOffset);
     return false;
   }
 
@@ -1222,11 +1309,11 @@ bool readNtHeader(bounded_buffer *b, nt_header_32 &header) {
       splitBuffer(b, offsetof(nt_header_32, FileHeader), b->bufLen);
 
   if (fhb == nullptr) {
-    PE_ERR(PEERR_MEM);
+    PE_DIAG(PEERR_MEM, diag);
     return false;
   }
 
-  if (!readFileHeader(fhb, header.FileHeader)) {
+  if (!readFileHeader(fhb, header.FileHeader, diag)) {
     deleteBuffer(fhb);
     return false;
   }
@@ -1262,7 +1349,7 @@ bool readNtHeader(bounded_buffer *b, nt_header_32 &header) {
 
   if (ohb == nullptr) {
     deleteBuffer(fhb);
-    PE_ERR(PEERR_MEM);
+    PE_DIAG(PEERR_MEM, diag);
     return false;
   }
 
@@ -1270,7 +1357,7 @@ bool readNtHeader(bounded_buffer *b, nt_header_32 &header) {
    * Read the Magic to determine if it is 32 or 64.
    */
   if (!readWord(ohb, 0, header.OptionalMagic)) {
-    PE_ERR(PEERR_READ);
+    PE_DIAG_AT(PEERR_READ, diag, 0);
     if (ohb != nullptr) {
       deleteBuffer(ohb);
     }
@@ -1278,19 +1365,19 @@ bool readNtHeader(bounded_buffer *b, nt_header_32 &header) {
     return false;
   }
   if (header.OptionalMagic == NT_OPTIONAL_32_MAGIC) {
-    if (!readOptionalHeader(ohb, header.OptionalHeader)) {
+    if (!readOptionalHeader(ohb, header.OptionalHeader, diag)) {
       deleteBuffer(ohb);
       deleteBuffer(fhb);
       return false;
     }
   } else if (header.OptionalMagic == NT_OPTIONAL_64_MAGIC) {
-    if (!readOptionalHeader64(ohb, header.OptionalHeader64)) {
+    if (!readOptionalHeader64(ohb, header.OptionalHeader64, diag)) {
       deleteBuffer(ohb);
       deleteBuffer(fhb);
       return false;
     }
   } else {
-    PE_ERR(PEERR_MAGIC);
+    PE_DIAG(PEERR_MAGIC, diag);
     deleteBuffer(ohb);
     deleteBuffer(fhb);
     return false;
@@ -1349,8 +1436,10 @@ std::uint32_t calculateRichChecksum(const bounded_buffer *b, pe_header &p) {
 
 bool readRichHeader(bounded_buffer *rich_buf,
                     std::uint32_t key,
-                    rich_header &rich_hdr) {
+                    rich_header &rich_hdr,
+                    PEDiagnostic &diag) {
   if (rich_buf == nullptr) {
+    PE_DIAG(PEERR_BUFFER, diag);
     return false;
   }
 
@@ -1361,7 +1450,7 @@ bool readRichHeader(bounded_buffer *rich_buf,
   // The first decrypted DWORD value of the rich header
   // at offset 0 should be 0x536e6144 aka the "DanS" signature
   if (!readDword(rich_buf, 0, encrypted_dword)) {
-    PE_ERR(PEERR_READ);
+    PE_DIAG_AT(PEERR_READ, diag, 0);
     return false;
   }
 
@@ -1387,7 +1476,7 @@ bool readRichHeader(bounded_buffer *rich_buf,
     rich_entry entry;
     // Read first DWORD of entry and decrypt it
     if (!readDword(rich_buf, i, encrypted_dword)) {
-      PE_ERR(PEERR_READ);
+      PE_DIAG_AT(PEERR_READ, diag, i);
       return false;
     }
     decrypted_dword = encrypted_dword ^ key;
@@ -1398,7 +1487,7 @@ bool readRichHeader(bounded_buffer *rich_buf,
 
     // The second DWORD represents the use count
     if (!readDword(rich_buf, i + 4, encrypted_dword)) {
-      PE_ERR(PEERR_READ);
+      PE_DIAG_AT(PEERR_READ, diag, i + 4);
       return false;
     }
     decrypted_dword = encrypted_dword ^ key;
@@ -1411,11 +1500,11 @@ bool readRichHeader(bounded_buffer *rich_buf,
 
   // Preserve the end signature aka "Rich" magic
   if (!readDword(rich_buf, rich_buf->bufLen - 4, rich_hdr.EndSignature)) {
-    PE_ERR(PEERR_READ);
+    PE_DIAG_AT(PEERR_READ, diag, rich_buf->bufLen - 4);
     return false;
   };
   if (rich_hdr.EndSignature != RICH_MAGIC_END) {
-    PE_ERR(PEERR_MAGIC);
+    PE_DIAG_AT(PEERR_MAGIC, diag, rich_buf->bufLen - 4);
     return false;
   }
 
@@ -1425,56 +1514,64 @@ bool readRichHeader(bounded_buffer *rich_buf,
   return true;
 }
 
-bool readDosHeader(bounded_buffer *file, dos_header &dos_hdr) {
+bool readDosHeader(bounded_buffer *file,
+                   dos_header &dos_hdr,
+                   PEDiagnostic &diag) {
   if (file == nullptr) {
+    PE_DIAG(PEERR_BUFFER, diag);
     return false;
   }
 
-  READ_WORD(file, 0, dos_hdr, e_magic);
-  READ_WORD(file, 0, dos_hdr, e_cblp);
-  READ_WORD(file, 0, dos_hdr, e_cp);
-  READ_WORD(file, 0, dos_hdr, e_crlc);
-  READ_WORD(file, 0, dos_hdr, e_cparhdr);
-  READ_WORD(file, 0, dos_hdr, e_minalloc);
-  READ_WORD(file, 0, dos_hdr, e_maxalloc);
-  READ_WORD(file, 0, dos_hdr, e_ss);
-  READ_WORD(file, 0, dos_hdr, e_sp);
-  READ_WORD(file, 0, dos_hdr, e_csum);
-  READ_WORD(file, 0, dos_hdr, e_ip);
-  READ_WORD(file, 0, dos_hdr, e_cs);
-  READ_WORD(file, 0, dos_hdr, e_lfarlc);
-  READ_WORD(file, 0, dos_hdr, e_ovno);
-  READ_WORD(file, 0, dos_hdr, e_res[0]);
-  READ_WORD(file, 0, dos_hdr, e_res[1]);
-  READ_WORD(file, 0, dos_hdr, e_res[2]);
-  READ_WORD(file, 0, dos_hdr, e_res[3]);
-  READ_WORD(file, 0, dos_hdr, e_oemid);
-  READ_WORD(file, 0, dos_hdr, e_oeminfo);
-  READ_WORD(file, 0, dos_hdr, e_res2[0]);
-  READ_WORD(file, 0, dos_hdr, e_res2[1]);
-  READ_WORD(file, 0, dos_hdr, e_res2[2]);
-  READ_WORD(file, 0, dos_hdr, e_res2[3]);
-  READ_WORD(file, 0, dos_hdr, e_res2[4]);
-  READ_WORD(file, 0, dos_hdr, e_res2[5]);
-  READ_WORD(file, 0, dos_hdr, e_res2[6]);
-  READ_WORD(file, 0, dos_hdr, e_res2[7]);
-  READ_WORD(file, 0, dos_hdr, e_res2[8]);
-  READ_WORD(file, 0, dos_hdr, e_res2[9]);
-  READ_DWORD(file, 0, dos_hdr, e_lfanew);
+  READ_WORD_DIAG(file, 0, dos_hdr, e_magic, diag);
+  READ_WORD_DIAG(file, 0, dos_hdr, e_cblp, diag);
+  READ_WORD_DIAG(file, 0, dos_hdr, e_cp, diag);
+  READ_WORD_DIAG(file, 0, dos_hdr, e_crlc, diag);
+  READ_WORD_DIAG(file, 0, dos_hdr, e_cparhdr, diag);
+  READ_WORD_DIAG(file, 0, dos_hdr, e_minalloc, diag);
+  READ_WORD_DIAG(file, 0, dos_hdr, e_maxalloc, diag);
+  READ_WORD_DIAG(file, 0, dos_hdr, e_ss, diag);
+  READ_WORD_DIAG(file, 0, dos_hdr, e_sp, diag);
+  READ_WORD_DIAG(file, 0, dos_hdr, e_csum, diag);
+  READ_WORD_DIAG(file, 0, dos_hdr, e_ip, diag);
+  READ_WORD_DIAG(file, 0, dos_hdr, e_cs, diag);
+  READ_WORD_DIAG(file, 0, dos_hdr, e_lfarlc, diag);
+  READ_WORD_DIAG(file, 0, dos_hdr, e_ovno, diag);
+  READ_WORD_DIAG(file, 0, dos_hdr, e_res[0], diag);
+  READ_WORD_DIAG(file, 0, dos_hdr, e_res[1], diag);
+  READ_WORD_DIAG(file, 0, dos_hdr, e_res[2], diag);
+  READ_WORD_DIAG(file, 0, dos_hdr, e_res[3], diag);
+  READ_WORD_DIAG(file, 0, dos_hdr, e_oemid, diag);
+  READ_WORD_DIAG(file, 0, dos_hdr, e_oeminfo, diag);
+  READ_WORD_DIAG(file, 0, dos_hdr, e_res2[0], diag);
+  READ_WORD_DIAG(file, 0, dos_hdr, e_res2[1], diag);
+  READ_WORD_DIAG(file, 0, dos_hdr, e_res2[2], diag);
+  READ_WORD_DIAG(file, 0, dos_hdr, e_res2[3], diag);
+  READ_WORD_DIAG(file, 0, dos_hdr, e_res2[4], diag);
+  READ_WORD_DIAG(file, 0, dos_hdr, e_res2[5], diag);
+  READ_WORD_DIAG(file, 0, dos_hdr, e_res2[6], diag);
+  READ_WORD_DIAG(file, 0, dos_hdr, e_res2[7], diag);
+  READ_WORD_DIAG(file, 0, dos_hdr, e_res2[8], diag);
+  READ_WORD_DIAG(file, 0, dos_hdr, e_res2[9], diag);
+  READ_DWORD_DIAG(file, 0, dos_hdr, e_lfanew, diag);
 
   return true;
 }
 
-bool getHeader(bounded_buffer *file, pe_header &p, bounded_buffer *&rem) {
+bool getHeader(bounded_buffer *file,
+               pe_header &p,
+               bounded_buffer *&rem,
+               PEDiagnostic &diag) {
   if (file == nullptr) {
+    PE_DIAG(PEERR_BUFFER, diag);
     return false;
   }
 
   // read the DOS header
-  readDosHeader(file, p.dos);
+  diag.stage = PE_STAGE_DOS_HEADER;
+  readDosHeader(file, p.dos, diag);
 
   if (p.dos.e_magic != MZ_MAGIC) {
-    PE_ERR(PEERR_MAGIC);
+    PE_DIAG_AT(PEERR_MAGIC, diag, 0);
     return false;
   }
 
@@ -1492,9 +1589,10 @@ bool getHeader(bounded_buffer *file, pe_header &p, bounded_buffer *&rem) {
   // Note: 0x80 is based on anecdotal evidence.
   //
   // Iterate over the DWORDs, hence why i increments 4 bytes at a time.
+  diag.stage = PE_STAGE_RICH_HEADER;
   for (std::uint32_t i = RICH_OFFSET; i < offset; i += 4) {
     if (!readDword(file, i, dword)) {
-      PE_ERR(PEERR_READ);
+      PE_DIAG_AT(PEERR_READ, diag, i);
       return false;
     }
 
@@ -1510,7 +1608,7 @@ bool getHeader(bounded_buffer *file, pe_header &p, bounded_buffer *&rem) {
     // Get the XOR decryption key.  It is the DWORD immediately
     // after the Rich signature.
     if (!readDword(file, rich_end_signature_offset + 4, xor_key)) {
-      PE_ERR(PEERR_READ);
+      PE_DIAG_AT(PEERR_READ, diag, rich_end_signature_offset + 4);
       return false;
     }
 
@@ -1518,10 +1616,11 @@ bool getHeader(bounded_buffer *file, pe_header &p, bounded_buffer *&rem) {
     bounded_buffer *richBuf =
         splitBuffer(file, 0x80, rich_end_signature_offset + 4);
     if (richBuf == nullptr) {
+      PE_DIAG(PEERR_MEM, diag);
       return false;
     }
 
-    readRichHeader(richBuf, xor_key, p.rich);
+    readRichHeader(richBuf, xor_key, p.rich, diag);
     if (richBuf != nullptr) {
       deleteBuffer(richBuf);
     }
@@ -1530,6 +1629,7 @@ bool getHeader(bounded_buffer *file, pe_header &p, bounded_buffer *&rem) {
     // starts at offset 0 and has length 0x80
     bounded_buffer *dosBuf = splitBuffer(file, 0, RICH_OFFSET);
     if (dosBuf == nullptr) {
+      PE_DIAG(PEERR_MEM, diag);
       return false;
     }
     // Calculate checksum
@@ -1550,9 +1650,14 @@ bool getHeader(bounded_buffer *file, pe_header &p, bounded_buffer *&rem) {
 
   // now, we can read out the fields of the NT headers
   bounded_buffer *ntBuf = splitBuffer(file, curOffset, file->bufLen);
+  if (ntBuf == nullptr) {
+    PE_DIAG(PEERR_MEM, diag);
+    return false;
+  }
 
-  if (!readNtHeader(ntBuf, p.nt)) {
-    // err is set by readNtHeader
+  diag.stage = PE_STAGE_NT_HEADERS;
+  if (!readNtHeader(ntBuf, p.nt, diag)) {
+    // The diagnostic is populated by readNtHeader and its helpers.
     if (ntBuf != nullptr) {
       deleteBuffer(ntBuf);
     }
@@ -1573,13 +1678,18 @@ bool getHeader(bounded_buffer *file, pe_header &p, bounded_buffer *&rem) {
     rem_size = sizeof(std::uint32_t) + sizeof(file_header) +
                sizeof(optional_header_64);
   } else {
-    PE_ERR(PEERR_MAGIC);
+    PE_DIAG(PEERR_MAGIC, diag);
     deleteBuffer(ntBuf);
     return false;
   }
 
   // update 'rem' to point to the space after the header
   rem = splitBuffer(ntBuf, rem_size, ntBuf->bufLen);
+  if (rem == nullptr) {
+    PE_DIAG(PEERR_MEM, diag);
+    deleteBuffer(ntBuf);
+    return false;
+  }
   deleteBuffer(ntBuf);
 
   return true;
@@ -1588,13 +1698,15 @@ bool getHeader(bounded_buffer *file, pe_header &p, bounded_buffer *&rem) {
 static bool parseExports(parsed_pe *p,
                          const data_directory &exportDir,
                          VA imageBase,
-                         std::vector<exportent> &parsedExports) {
+                         std::vector<exportent> &parsedExports,
+                         PEDiagnostic &diag) {
   const std::vector<section> &sections = p->internal->secs;
 
   section s;
   std::uint32_t rvaofft;
   if (!getSectionForRVA(
           sections, imageBase, exportDir.VirtualAddress, s, rvaofft)) {
+    PE_DIAG_AT(PEERR_SECTVA, diag, exportDir.VirtualAddress);
     return false;
   }
 
@@ -1633,6 +1745,7 @@ static bool parseExports(parsed_pe *p,
   section eatSec;
   std::uint32_t eatOff;
   if (!getSectionForRVA(sections, imageBase, eatRVA, eatSec, eatOff)) {
+    PE_DIAG_AT(PEERR_SECTVA, diag, eatRVA);
     return false;
   }
 
@@ -1712,6 +1825,7 @@ static bool parseExports(parsed_pe *p,
       }
 
       if (ordinal >= addressTableEntries) {
+        PE_DIAG_AT(PEERR_MAGIC, diag, ordinalEntryOff);
         return false;
       }
 
@@ -1759,7 +1873,10 @@ static bool parseExports(parsed_pe *p,
   return true;
 }
 
-bool getExports(parsed_pe *p) {
+bool getExports(parsed_pe *p, PEDiagnostic &diag) {
+  diag.stage = PE_STAGE_EXPORTS;
+  diag.directory = DIR_EXPORT;
+  diag.directoryKnown = true;
   data_directory exportDir;
   VA imageBase;
 
@@ -1770,6 +1887,7 @@ bool getExports(parsed_pe *p) {
     exportDir = p->peHeader.nt.OptionalHeader64.DataDirectory[DIR_EXPORT];
     imageBase = p->peHeader.nt.OptionalHeader64.ImageBase;
   } else {
+    PE_DIAG(PEERR_MAGIC, diag);
     return false;
   }
 
@@ -1778,7 +1896,7 @@ bool getExports(parsed_pe *p) {
   }
 
   std::vector<exportent> parsedExports;
-  if (!parseExports(p, exportDir, imageBase, parsedExports)) {
+  if (!parseExports(p, exportDir, imageBase, parsedExports, diag)) {
     return exportDir.Size == 0;
   }
 
@@ -1787,13 +1905,17 @@ bool getExports(parsed_pe *p) {
   return true;
 }
 
-bool getRelocations(parsed_pe *p) {
+bool getRelocations(parsed_pe *p, PEDiagnostic &diag) {
+  diag.stage = PE_STAGE_RELOCATIONS;
+  diag.directory = DIR_BASERELOC;
+  diag.directoryKnown = true;
   data_directory relocDir;
   if (p->peHeader.nt.OptionalMagic == NT_OPTIONAL_32_MAGIC) {
     relocDir = p->peHeader.nt.OptionalHeader.DataDirectory[DIR_BASERELOC];
   } else if (p->peHeader.nt.OptionalMagic == NT_OPTIONAL_64_MAGIC) {
     relocDir = p->peHeader.nt.OptionalHeader64.DataDirectory[DIR_BASERELOC];
   } else {
+    PE_DIAG(PEERR_MAGIC, diag);
     return false;
   }
 
@@ -1807,10 +1929,12 @@ bool getRelocations(parsed_pe *p) {
       vaAddr =
           relocDir.VirtualAddress + p->peHeader.nt.OptionalHeader64.ImageBase;
     } else {
+      PE_DIAG(PEERR_MAGIC, diag);
       return false;
     }
 
     if (!getSecForVA(p->internal->secs, vaAddr, d)) {
+      PE_DIAG(PEERR_SECTVA, diag);
       return false;
     }
 
@@ -1823,12 +1947,14 @@ bool getRelocations(parsed_pe *p) {
       if (!readDword(d.sectionData,
                      rvaofft + offsetof(reloc_block, PageRVA),
                      pageRva)) {
+        PE_DIAG_AT(PEERR_READ, diag, rvaofft);
         return false;
       }
 
       if (!readDword(d.sectionData,
                      rvaofft + offsetof(reloc_block, BlockSize),
                      blockSize)) {
+        PE_DIAG_AT(PEERR_READ, diag, rvaofft);
         return false;
       }
 
@@ -1848,6 +1974,7 @@ bool getRelocations(parsed_pe *p) {
         std::uint16_t offset;
 
         if (!readWord(d.sectionData, rvaofft, entry)) {
+          PE_DIAG_AT(PEERR_READ, diag, rvaofft);
           return false;
         }
 
@@ -1864,6 +1991,7 @@ bool getRelocations(parsed_pe *p) {
           relocVA =
               pageRva + offset + p->peHeader.nt.OptionalHeader64.ImageBase;
         } else {
+          PE_DIAG(PEERR_MAGIC, diag);
           return false;
         }
 
@@ -1883,13 +2011,17 @@ bool getRelocations(parsed_pe *p) {
   return true;
 }
 
-bool getDebugDir(parsed_pe *p) {
+bool getDebugDir(parsed_pe *p, PEDiagnostic &diag) {
+  diag.stage = PE_STAGE_DEBUG;
+  diag.directory = DIR_DEBUG;
+  diag.directoryKnown = true;
   data_directory debugDir;
   if (p->peHeader.nt.OptionalMagic == NT_OPTIONAL_32_MAGIC) {
     debugDir = p->peHeader.nt.OptionalHeader.DataDirectory[DIR_DEBUG];
   } else if (p->peHeader.nt.OptionalMagic == NT_OPTIONAL_64_MAGIC) {
     debugDir = p->peHeader.nt.OptionalHeader64.DataDirectory[DIR_DEBUG];
   } else {
+    PE_DIAG(PEERR_MAGIC, diag);
     return false;
   }
 
@@ -1903,6 +2035,7 @@ bool getDebugDir(parsed_pe *p) {
       vaAddr =
           debugDir.VirtualAddress + p->peHeader.nt.OptionalHeader64.ImageBase;
     } else {
+      PE_DIAG(PEERR_MAGIC, diag);
       return false;
     }
 
@@ -1912,6 +2045,7 @@ bool getDebugDir(parsed_pe *p) {
     // this will return the rdata section, where the debug directories are
     //
     if (!getSecForVA(p->internal->secs, vaAddr, d)) {
+      PE_DIAG(PEERR_SECTVA, diag);
       return false;
     }
 
@@ -1926,14 +2060,16 @@ bool getDebugDir(parsed_pe *p) {
     for (uint32_t i = 0; i < numOfDebugEnts; i++) {
       debug_dir_entry curEnt = emptyEnt;
 
-      READ_DWORD(d.sectionData, rvaofft, curEnt, Characteristics);
-      READ_DWORD(d.sectionData, rvaofft, curEnt, TimeStamp);
-      READ_WORD(d.sectionData, rvaofft, curEnt, MajorVersion);
-      READ_WORD(d.sectionData, rvaofft, curEnt, MinorVersion);
-      READ_DWORD(d.sectionData, rvaofft, curEnt, Type);
-      READ_DWORD(d.sectionData, rvaofft, curEnt, SizeOfData);
-      READ_DWORD(d.sectionData, rvaofft, curEnt, AddressOfRawData);
-      READ_DWORD(d.sectionData, rvaofft, curEnt, PointerToRawData);
+      READ_DWORD_DIAG(d.sectionData, rvaofft, curEnt, Characteristics, diag);
+      READ_DWORD_DIAG(d.sectionData, rvaofft, curEnt, TimeStamp, diag);
+      READ_WORD_DIAG(d.sectionData, rvaofft, curEnt, MajorVersion, diag);
+      READ_WORD_DIAG(d.sectionData, rvaofft, curEnt, MinorVersion, diag);
+      READ_DWORD_DIAG(d.sectionData, rvaofft, curEnt, Type, diag);
+      READ_DWORD_DIAG(d.sectionData, rvaofft, curEnt, SizeOfData, diag);
+      READ_DWORD_DIAG(
+          d.sectionData, rvaofft, curEnt, AddressOfRawData, diag);
+      READ_DWORD_DIAG(
+          d.sectionData, rvaofft, curEnt, PointerToRawData, diag);
 
       // are all the fields in curEnt null? then we break
       if (curEnt.SizeOfData == 0 && curEnt.AddressOfRawData == 0 &&
@@ -1989,13 +2125,17 @@ bool getDebugDir(parsed_pe *p) {
   return true;
 }
 
-bool getImports(parsed_pe *p) {
+bool getImports(parsed_pe *p, PEDiagnostic &diag) {
+  diag.stage = PE_STAGE_IMPORTS;
+  diag.directory = DIR_IMPORT;
+  diag.directoryKnown = true;
   data_directory importDir;
   if (p->peHeader.nt.OptionalMagic == NT_OPTIONAL_32_MAGIC) {
     importDir = p->peHeader.nt.OptionalHeader.DataDirectory[DIR_IMPORT];
   } else if (p->peHeader.nt.OptionalMagic == NT_OPTIONAL_64_MAGIC) {
     importDir = p->peHeader.nt.OptionalHeader64.DataDirectory[DIR_IMPORT];
   } else {
+    PE_DIAG(PEERR_MAGIC, diag);
     return false;
   }
 
@@ -2009,10 +2149,12 @@ bool getImports(parsed_pe *p) {
       addr =
           importDir.VirtualAddress + p->peHeader.nt.OptionalHeader64.ImageBase;
     } else {
+      PE_DIAG(PEERR_MAGIC, diag);
       return false;
     }
 
     if (!getSecForVA(p->internal->secs, addr, c)) {
+      PE_DIAG(PEERR_SECTVA, diag);
       return false;
     }
 
@@ -2026,11 +2168,11 @@ bool getImports(parsed_pe *p) {
       // read each directory entry out
       import_dir_entry curEnt = emptyEnt;
 
-      READ_DWORD(c.sectionData, offt, curEnt, LookupTableRVA);
-      READ_DWORD(c.sectionData, offt, curEnt, TimeStamp);
-      READ_DWORD(c.sectionData, offt, curEnt, ForwarderChain);
-      READ_DWORD(c.sectionData, offt, curEnt, NameRVA);
-      READ_DWORD(c.sectionData, offt, curEnt, AddressRVA);
+      READ_DWORD_DIAG(c.sectionData, offt, curEnt, LookupTableRVA, diag);
+      READ_DWORD_DIAG(c.sectionData, offt, curEnt, TimeStamp, diag);
+      READ_DWORD_DIAG(c.sectionData, offt, curEnt, ForwarderChain, diag);
+      READ_DWORD_DIAG(c.sectionData, offt, curEnt, NameRVA, diag);
+      READ_DWORD_DIAG(c.sectionData, offt, curEnt, AddressRVA, diag);
 
       // are all the fields in curEnt null? then we break
       if (curEnt.LookupTableRVA == 0 && curEnt.NameRVA == 0 &&
@@ -2045,17 +2187,20 @@ bool getImports(parsed_pe *p) {
       } else if (p->peHeader.nt.OptionalMagic == NT_OPTIONAL_64_MAGIC) {
         name = curEnt.NameRVA + p->peHeader.nt.OptionalHeader64.ImageBase;
       } else {
+        PE_DIAG(PEERR_MAGIC, diag);
         return false;
       }
 
       section nameSec;
       if (!getSecForVA(p->internal->secs, name, nameSec)) {
+        PE_DIAG_AT(PEERR_SECTVA, diag, curEnt.NameRVA);
         return false;
       }
 
       auto nameOff = static_cast<std::uint32_t>(name - nameSec.sectionBase);
       std::string modName;
       if (!readCString(*nameSec.sectionData, nameOff, modName)) {
+        PE_DIAG_AT(PEERR_READ, diag, nameOff);
         return false;
       }
 
@@ -2081,6 +2226,7 @@ bool getImports(parsed_pe *p) {
           lookupVA =
               curEnt.LookupTableRVA + p->peHeader.nt.OptionalHeader64.ImageBase;
         } else {
+          PE_DIAG(PEERR_MAGIC, diag);
           return false;
         }
       } else if (curEnt.AddressRVA != 0) {
@@ -2091,6 +2237,7 @@ bool getImports(parsed_pe *p) {
           lookupVA =
               curEnt.AddressRVA + p->peHeader.nt.OptionalHeader64.ImageBase;
         } else {
+          PE_DIAG(PEERR_MAGIC, diag);
           return false;
         }
       }
@@ -2098,6 +2245,7 @@ bool getImports(parsed_pe *p) {
       section lookupSec;
       if (lookupVA == 0 ||
           !getSecForVA(p->internal->secs, lookupVA, lookupSec)) {
+        PE_DIAG_AT(PEERR_SECTVA, diag, curEnt.LookupTableRVA);
         return false;
       }
 
@@ -2131,6 +2279,7 @@ bool getImports(parsed_pe *p) {
           oval = (val64 & ~0xFFFF0000);
           valVA = val64 + p->peHeader.nt.OptionalHeader64.ImageBase;
         } else {
+          PE_DIAG(PEERR_MAGIC, diag);
           return false;
         }
 
@@ -2140,6 +2289,7 @@ bool getImports(parsed_pe *p) {
           section symNameSec;
 
           if (!getSecForVA(p->internal->secs, valVA, symNameSec)) {
+            PE_DIAG(PEERR_SECTVA, diag);
             return false;
           }
 
@@ -2170,6 +2320,7 @@ bool getImports(parsed_pe *p) {
             ent.addr = offInTable + curEnt.AddressRVA +
                        p->peHeader.nt.OptionalHeader64.ImageBase;
           } else {
+            PE_DIAG(PEERR_MAGIC, diag);
             return false;
           }
 
@@ -2189,6 +2340,7 @@ bool getImports(parsed_pe *p) {
             ent.addr = offInTable + curEnt.AddressRVA +
                        p->peHeader.nt.OptionalHeader64.ImageBase;
           } else {
+            PE_DIAG(PEERR_MAGIC, diag);
             return false;
           }
 
@@ -2205,6 +2357,7 @@ bool getImports(parsed_pe *p) {
           lookupOff += sizeof(std::uint64_t);
           offInTable += sizeof(std::uint64_t);
         } else {
+          PE_DIAG(PEERR_MAGIC, diag);
           return false;
         }
       } while (true);
@@ -2216,7 +2369,9 @@ bool getImports(parsed_pe *p) {
   return true;
 }
 
-bool getSymbolTable(parsed_pe *p) {
+bool getSymbolTable(parsed_pe *p, PEDiagnostic &diag) {
+  diag.stage = PE_STAGE_SYMBOL_TABLE;
+  diag.directoryKnown = false;
   if (p->peHeader.nt.FileHeader.PointerToSymbolTable == 0) {
     return true;
   }
@@ -2233,7 +2388,7 @@ bool getSymbolTable(parsed_pe *p) {
 
     // Read name
     if (!readQword(p->fileBuffer, offset, sym.name.data)) {
-      PE_ERR(PEERR_MAGIC);
+      PE_DIAG(PEERR_MAGIC, diag);
       return false;
     }
 
@@ -2246,7 +2401,7 @@ bool getSymbolTable(parsed_pe *p) {
       uint8_t ch;
       for (;;) {
         if (!readByte(p->fileBuffer, strOffset, ch)) {
-          PE_ERR(PEERR_MAGIC);
+          PE_DIAG(PEERR_MAGIC, diag);
           return false;
         }
         if (ch == 0u) {
@@ -2267,7 +2422,7 @@ bool getSymbolTable(parsed_pe *p) {
 
     // Read value
     if (!readDword(p->fileBuffer, offset, sym.value)) {
-      PE_ERR(PEERR_MAGIC);
+      PE_DIAG(PEERR_MAGIC, diag);
       return false;
     }
 
@@ -2276,7 +2431,7 @@ bool getSymbolTable(parsed_pe *p) {
     // Read section number
     uint16_t secNum;
     if (!readWord(p->fileBuffer, offset, secNum)) {
-      PE_ERR(PEERR_MAGIC);
+      PE_DIAG(PEERR_MAGIC, diag);
       return false;
     }
     sym.sectionNumber = static_cast<std::int16_t>(secNum);
@@ -2285,7 +2440,7 @@ bool getSymbolTable(parsed_pe *p) {
 
     // Read type
     if (!readWord(p->fileBuffer, offset, sym.type)) {
-      PE_ERR(PEERR_MAGIC);
+      PE_DIAG(PEERR_MAGIC, diag);
       return false;
     }
 
@@ -2293,7 +2448,7 @@ bool getSymbolTable(parsed_pe *p) {
 
     // Read storage class
     if (!readByte(p->fileBuffer, offset, sym.storageClass)) {
-      PE_ERR(PEERR_MAGIC);
+      PE_DIAG(PEERR_MAGIC, diag);
       return false;
     }
 
@@ -2301,7 +2456,7 @@ bool getSymbolTable(parsed_pe *p) {
 
     // Read number of auxiliary symbols
     if (!readByte(p->fileBuffer, offset, sym.numberOfAuxSymbols)) {
-      PE_ERR(PEERR_MAGIC);
+      PE_DIAG(PEERR_MAGIC, diag);
       return false;
     }
 
@@ -2331,7 +2486,7 @@ bool getSymbolTable(parsed_pe *p) {
 
         // Read tag index
         if (!readDword(p->fileBuffer, offset, asym.tagIndex)) {
-          PE_ERR(PEERR_MAGIC);
+          PE_DIAG(PEERR_MAGIC, diag);
           return false;
         }
 
@@ -2339,7 +2494,7 @@ bool getSymbolTable(parsed_pe *p) {
 
         // Read total size
         if (!readDword(p->fileBuffer, offset, asym.totalSize)) {
-          PE_ERR(PEERR_MAGIC);
+          PE_DIAG(PEERR_MAGIC, diag);
           return false;
         }
 
@@ -2347,7 +2502,7 @@ bool getSymbolTable(parsed_pe *p) {
 
         // Read pointer to line number
         if (!readDword(p->fileBuffer, offset, asym.pointerToLineNumber)) {
-          PE_ERR(PEERR_MAGIC);
+          PE_DIAG(PEERR_MAGIC, diag);
           return false;
         }
 
@@ -2355,7 +2510,7 @@ bool getSymbolTable(parsed_pe *p) {
 
         // Read pointer to next function
         if (!readDword(p->fileBuffer, offset, asym.pointerToNextFunction)) {
-          PE_ERR(PEERR_MAGIC);
+          PE_DIAG(PEERR_MAGIC, diag);
           return false;
         }
 
@@ -2376,7 +2531,7 @@ bool getSymbolTable(parsed_pe *p) {
 
         // Read line number
         if (!readWord(p->fileBuffer, offset, asym.lineNumber)) {
-          PE_ERR(PEERR_MAGIC);
+          PE_DIAG(PEERR_MAGIC, diag);
           return false;
         }
 
@@ -2387,7 +2542,7 @@ bool getSymbolTable(parsed_pe *p) {
 
         // Read pointer to next function
         if (!readDword(p->fileBuffer, offset, asym.pointerToNextFunction)) {
-          PE_ERR(PEERR_MAGIC);
+          PE_DIAG(PEERR_MAGIC, diag);
           return false;
         }
 
@@ -2407,13 +2562,13 @@ bool getSymbolTable(parsed_pe *p) {
 
         // Read line number
         if (!readDword(p->fileBuffer, offset, asym.tagIndex)) {
-          PE_ERR(PEERR_MAGIC);
+          PE_DIAG(PEERR_MAGIC, diag);
           return false;
         }
 
         // Read characteristics
         if (!readDword(p->fileBuffer, offset, asym.characteristics)) {
-          PE_ERR(PEERR_MAGIC);
+          PE_DIAG(PEERR_MAGIC, diag);
           return false;
         }
 
@@ -2436,7 +2591,7 @@ bool getSymbolTable(parsed_pe *p) {
         for (std::uint16_t j = 0; j < SYMTAB_RECORD_LEN; j++) {
           // Save the raw field
           if (!readByte(p->fileBuffer, offset, asym.filename[j])) {
-            PE_ERR(PEERR_MAGIC);
+            PE_DIAG(PEERR_MAGIC, diag);
             return false;
           }
 
@@ -2463,7 +2618,7 @@ bool getSymbolTable(parsed_pe *p) {
 
         // Read length
         if (!readDword(p->fileBuffer, offset, asym.length)) {
-          PE_ERR(PEERR_MAGIC);
+          PE_DIAG(PEERR_MAGIC, diag);
           return false;
         }
 
@@ -2471,7 +2626,7 @@ bool getSymbolTable(parsed_pe *p) {
 
         // Read number of relocations
         if (!readWord(p->fileBuffer, offset, asym.numberOfRelocations)) {
-          PE_ERR(PEERR_MAGIC);
+          PE_DIAG(PEERR_MAGIC, diag);
           return false;
         }
 
@@ -2479,7 +2634,7 @@ bool getSymbolTable(parsed_pe *p) {
 
         // Read number of line numbers
         if (!readWord(p->fileBuffer, offset, asym.numberOfLineNumbers)) {
-          PE_ERR(PEERR_MAGIC);
+          PE_DIAG(PEERR_MAGIC, diag);
           return false;
         }
 
@@ -2487,7 +2642,7 @@ bool getSymbolTable(parsed_pe *p) {
 
         // Read checksum
         if (!readDword(p->fileBuffer, offset, asym.checkSum)) {
-          PE_ERR(PEERR_MAGIC);
+          PE_DIAG(PEERR_MAGIC, diag);
           return false;
         }
 
@@ -2495,7 +2650,7 @@ bool getSymbolTable(parsed_pe *p) {
 
         // Read number
         if (!readWord(p->fileBuffer, offset, asym.number)) {
-          PE_ERR(PEERR_MAGIC);
+          PE_DIAG(PEERR_MAGIC, diag);
           return false;
         }
 
@@ -2503,7 +2658,7 @@ bool getSymbolTable(parsed_pe *p) {
 
         // Read selection
         if (!readByte(p->fileBuffer, offset, asym.selection)) {
-          PE_ERR(PEERR_MAGIC);
+          PE_DIAG(PEERR_MAGIC, diag);
           return false;
         }
 
@@ -2554,14 +2709,23 @@ bool getSymbolTable(parsed_pe *p) {
   return true;
 }
 
-parsed_pe *ParsePEFromBuffer(bounded_buffer *buffer) {
+// Core parse routine. The diagnostic is already bound to this thread and
+// reset by the public entry points; this function must not reset it so that
+// failures recorded while opening/constructing the input buffer survive.
+static parsed_pe *ParsePEFromBufferImpl(bounded_buffer *buffer,
+                                        PEDiagnostic &diag) {
+  // Every parse call owns an isolated diagnostic. When the caller did not
+  // supply one, use a local instance so the machinery below is uniform; the
+  // failure remains mirrored into the thread-local GetPEErr* state.
+  ActiveDiagnosticGuard diagGuard(&diag);
+
   // First, create a new parsed_pe structure
   // We pass std::nothrow parameter to new so in case of failure it returns
   // nullptr instead of throwing exception std::bad_alloc.
   parsed_pe *p = new (std::nothrow) parsed_pe();
 
   if (p == nullptr) {
-    PE_ERR(PEERR_MEM);
+    PE_DIAG(PEERR_MEM, diag);
     return nullptr;
   }
 
@@ -2573,66 +2737,86 @@ parsed_pe *ParsePEFromBuffer(bounded_buffer *buffer) {
   if (p->internal == nullptr) {
     deleteBuffer(p->fileBuffer);
     delete p;
-    PE_ERR(PEERR_MEM);
+    PE_DIAG(PEERR_MEM, diag);
     return nullptr;
   }
 
   // get header information
   bounded_buffer *remaining = nullptr;
-  if (!getHeader(p->fileBuffer, p->peHeader, remaining)) {
+  if (!getHeader(p->fileBuffer, p->peHeader, remaining, diag)) {
     deleteBuffer(remaining);
     DestructParsedPE(p);
-    // err is set by getHeader
+    // The diagnostic is populated by getHeader and its helpers.
     return nullptr;
   }
 
   bounded_buffer *file = p->fileBuffer;
-  if (!getSections(remaining, file, p->peHeader.nt, p->internal->secs)) {
+  diag.stage = PE_STAGE_SECTIONS;
+  if (!getSections(remaining, file, p->peHeader.nt, p->internal->secs,
+                   diag)) {
     deleteBuffer(remaining);
     DestructParsedPE(p);
-    PE_ERR(PEERR_SECT);
+    PE_DIAG(PEERR_SECT, diag);
     return nullptr;
   }
 
-  if (!getResources(remaining, file, p->internal->secs, p->internal->rsrcs)) {
+  diag.stage = PE_STAGE_RESOURCES;
+  diag.directory = DIR_RESOURCE;
+  diag.directoryKnown = true;
+  if (!getResources(remaining, file, p->internal->secs, p->internal->rsrcs,
+                    diag)) {
     deleteBuffer(remaining);
     DestructParsedPE(p);
-    PE_ERR(PEERR_RESC);
+    PE_DIAG(PEERR_RESC, diag);
     return nullptr;
   }
 
   // Get exports
-  if (!getExports(p)) {
+  diag.stage = PE_STAGE_EXPORTS;
+  diag.directory = DIR_EXPORT;
+  diag.directoryKnown = true;
+  if (!getExports(p, diag)) {
     deleteBuffer(remaining);
     DestructParsedPE(p);
-    PE_ERR(PEERR_MAGIC);
+    PE_DIAG(PEERR_MAGIC, diag);
     return nullptr;
   }
 
   // Get relocations, if exist
-  if (!getRelocations(p)) {
+  diag.stage = PE_STAGE_RELOCATIONS;
+  diag.directory = DIR_BASERELOC;
+  diag.directoryKnown = true;
+  if (!getRelocations(p, diag)) {
     deleteBuffer(remaining);
     DestructParsedPE(p);
-    PE_ERR(PEERR_MAGIC);
+    PE_DIAG(PEERR_MAGIC, diag);
     return nullptr;
   }
 
-  if (!getDebugDir(p)) {
+  diag.stage = PE_STAGE_DEBUG;
+  diag.directory = DIR_DEBUG;
+  diag.directoryKnown = true;
+  if (!getDebugDir(p, diag)) {
     deleteBuffer(remaining);
     DestructParsedPE(p);
-    PE_ERR(PEERR_MAGIC);
+    PE_DIAG(PEERR_MAGIC, diag);
     return nullptr;
   }
 
   // Get imports
-  if (!getImports(p)) {
+  diag.stage = PE_STAGE_IMPORTS;
+  diag.directory = DIR_IMPORT;
+  diag.directoryKnown = true;
+  if (!getImports(p, diag)) {
     deleteBuffer(remaining);
     DestructParsedPE(p);
     return nullptr;
   }
 
   // Get symbol table
-  if (!getSymbolTable(p)) {
+  diag.stage = PE_STAGE_SYMBOL_TABLE;
+  diag.directoryKnown = false;
+  if (!getSymbolTable(p, diag)) {
     deleteBuffer(remaining);
     DestructParsedPE(p);
     return nullptr;
@@ -2640,29 +2824,86 @@ parsed_pe *ParsePEFromBuffer(bounded_buffer *buffer) {
 
   deleteBuffer(remaining);
 
+  // A successful parse leaves a clean diagnostic: callers can rely on
+  // code == PEERR_NONE with no stage/directory/offset residue.
+  diag.stage = PE_STAGE_NONE;
+  diag.directory = DIR_RESERVED;
+  diag.directoryKnown = false;
+  diag.offset = 0;
+  diag.offsetKnown = false;
+  diag.functionLocation.clear();
+  tls_err = PEERR_NONE;
+  tls_err_loc.clear();
+
   return p;
 }
 
-parsed_pe *ParsePEFromFile(const char *filePath) {
+parsed_pe *ParsePEFromBuffer(bounded_buffer *buffer,
+                             PEDiagnostic *diagnostic) {
+  PEDiagnostic localDiagnostic;
+  PEDiagnostic &diag =
+      diagnostic != nullptr ? *diagnostic : localDiagnostic;
+  resetDiag(diag);
+
+  diag.stage = PE_STAGE_BUFFER;
+  return ParsePEFromBufferImpl(buffer, diag);
+}
+
+parsed_pe *ParsePEFromBuffer(bounded_buffer *buffer) {
+  return ParsePEFromBuffer(buffer, nullptr);
+}
+
+parsed_pe *ParsePEFromFile(const char *filePath,
+                           PEDiagnostic *diagnostic) {
+  PEDiagnostic localDiagnostic;
+  PEDiagnostic &diag =
+      diagnostic != nullptr ? *diagnostic : localDiagnostic;
+  resetDiag(diag);
+
+  ActiveDiagnosticGuard diagGuard(&diag);
+  diag.stage = PE_STAGE_FILE_OPEN;
+
   auto buffer = readFileToFileBuffer(filePath);
 
   if (buffer == nullptr) {
-    // err is set by readFileToFileBuffer
+    // readFileToFileBuffer records the failure through the legacy macro,
+    // which mirrors it into the bound diagnostic.
     return nullptr;
   }
 
-  return ParsePEFromBuffer(buffer);
+  diag.stage = PE_STAGE_BUFFER;
+  // Hand the already populated diagnostic to the core routine directly, so
+  // that a failure recorded while opening the file keeps its stage context.
+  return ParsePEFromBufferImpl(buffer, diag);
 }
 
-parsed_pe *ParsePEFromPointer(std::uint8_t *ptr, std::uint32_t sz) {
+parsed_pe *ParsePEFromFile(const char *filePath) {
+  return ParsePEFromFile(filePath, nullptr);
+}
+
+parsed_pe *ParsePEFromPointer(std::uint8_t *ptr,
+                              std::uint32_t sz,
+                              PEDiagnostic *diagnostic) {
+  PEDiagnostic localDiagnostic;
+  PEDiagnostic &diag =
+      diagnostic != nullptr ? *diagnostic : localDiagnostic;
+  resetDiag(diag);
+
+  ActiveDiagnosticGuard diagGuard(&diag);
+  diag.stage = PE_STAGE_BUFFER;
+
   auto buffer = makeBufferFromPointer(ptr, sz);
 
   if (buffer == nullptr) {
-    // err is set by makeBufferFromPointer
+    // makeBufferFromPointer records the failure through the legacy macro.
     return nullptr;
   }
 
-  return ParsePEFromBuffer(buffer);
+  return ParsePEFromBufferImpl(buffer, diag);
+}
+
+parsed_pe *ParsePEFromPointer(std::uint8_t *ptr, std::uint32_t sz) {
+  return ParsePEFromPointer(ptr, sz, nullptr);
 }
 
 void DestructParsedPE(parsed_pe *p) {
