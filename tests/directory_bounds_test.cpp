@@ -189,6 +189,320 @@ ParsedPePtr parse(TestPe &pe) {
       DestructParsedPE);
 }
 
+struct ImportInfo {
+  VA addr;
+  std::string moduleName;
+  std::string symbolName;
+};
+
+enum class Bitness { Pe32, Pe32Plus };
+enum class ImportTarget { Descriptor, Name, Thunk };
+enum class BoundaryEnd { Section, File };
+
+constexpr std::uint32_t kImportSectionRva = kSectionRva;
+constexpr std::uint32_t kImportSectionRawOffset = kSectionRawOffset;
+constexpr std::uint32_t kImportGuardSize = 0x200;
+constexpr std::uint32_t kImportValidDescriptorOffset = 0;
+constexpr std::uint32_t kImportBoundaryDescriptorOffset = 0x14;
+constexpr std::uint32_t kImportDescriptorTerminatorOffset = 0x28;
+constexpr std::uint32_t kImportAddressTableOffset = 0x40;
+constexpr std::uint32_t kImportLookupTableOffset = 0x60;
+constexpr std::uint32_t kImportSymbolOffset = 0x80;
+constexpr std::uint32_t kImportModuleOffset = 0x90;
+
+void put64(std::vector<std::uint8_t> &buffer,
+           std::size_t offset,
+           std::uint64_t value) {
+  for (std::size_t i = 0; i < sizeof(value); ++i) {
+    buffer[offset + i] = static_cast<std::uint8_t>(value >> (8 * i));
+  }
+}
+
+std::size_t importOptionalHeaderOffset() {
+  return optionalHeaderOffset();
+}
+
+std::size_t importSectionHeaderOffset(Bitness bitness) {
+  if (bitness == Bitness::Pe32) {
+    return sectionHeaderOffset();
+  }
+
+  return importOptionalHeaderOffset() + sizeof(optional_header_64);
+}
+
+std::size_t importDataDirectoryOffset(Bitness bitness,
+                                      data_directory_kind kind) {
+  const auto optionalOffset = importOptionalHeaderOffset();
+  const auto dataDirectoryMember =
+      bitness == Bitness::Pe32 ? offsetof(optional_header_32, DataDirectory)
+                               : offsetof(optional_header_64, DataDirectory);
+  return optionalOffset + dataDirectoryMember +
+         (static_cast<std::size_t>(kind) * sizeof(data_directory));
+}
+
+void putImportDataDirectory(std::vector<std::uint8_t> &pe,
+                            Bitness bitness,
+                            data_directory_kind kind,
+                            std::uint32_t virtualAddress,
+                            std::uint32_t size) {
+  const auto offset = importDataDirectoryOffset(bitness, kind);
+  put32(pe, offset + offsetof(data_directory, VirtualAddress), virtualAddress);
+  put32(pe, offset + offsetof(data_directory, Size), size);
+}
+
+std::uint32_t importThunkWidth(Bitness bitness) {
+  return bitness == Bitness::Pe32 ? sizeof(std::uint32_t)
+                                  : sizeof(std::uint64_t);
+}
+
+std::uint32_t targetStructWidth(Bitness bitness, ImportTarget target) {
+  switch (target) {
+  case ImportTarget::Descriptor:
+    return sizeof(import_dir_entry);
+  case ImportTarget::Name:
+    return 1;
+  case ImportTarget::Thunk:
+    return importThunkWidth(bitness);
+  }
+
+  return 0;
+}
+
+std::uint32_t rvaForImportOffset(std::uint32_t sectionOffset) {
+  return kImportSectionRva + sectionOffset;
+}
+
+std::uint32_t fileOffsetForImportRva(std::uint32_t rva) {
+  return kImportSectionRawOffset + (rva - kImportSectionRva);
+}
+
+std::vector<std::uint8_t>
+makeMinimalImportPe(Bitness bitness,
+                    std::uint32_t sectionRawSize,
+                    std::uint32_t backingSize = kFileSize) {
+  std::vector<std::uint8_t> pe(backingSize, 0);
+
+  put16(pe, offsetof(dos_header, e_magic), MZ_MAGIC);
+  put32(pe, offsetof(dos_header, e_lfanew), kNtHeaderOffset);
+  put32(pe, kNtHeaderOffset, NT_MAGIC);
+
+  const auto fileHeaderOffset =
+      kNtHeaderOffset + offsetof(nt_header_32, FileHeader);
+  put16(pe,
+        fileHeaderOffset + offsetof(file_header, Machine),
+        bitness == Bitness::Pe32 ? IMAGE_FILE_MACHINE_I386
+                                 : IMAGE_FILE_MACHINE_AMD64);
+  put16(pe, fileHeaderOffset + offsetof(file_header, NumberOfSections), 1);
+
+  const auto optionalOffset = importOptionalHeaderOffset();
+  put16(pe,
+        optionalOffset,
+        bitness == Bitness::Pe32 ? NT_OPTIONAL_32_MAGIC
+                                 : NT_OPTIONAL_64_MAGIC);
+
+  if (bitness == Bitness::Pe32) {
+    put32(pe,
+          optionalOffset + offsetof(optional_header_32, ImageBase),
+          0x400000);
+    put32(pe,
+          optionalOffset +
+              offsetof(optional_header_32, NumberOfRvaAndSizes),
+          NUM_DIR_ENTRIES);
+  } else {
+    put64(pe,
+          optionalOffset + offsetof(optional_header_64, ImageBase),
+          0x140000000ULL);
+    put32(pe,
+          optionalOffset +
+              offsetof(optional_header_64, NumberOfRvaAndSizes),
+          NUM_DIR_ENTRIES);
+  }
+
+  const auto sectionHeader = importSectionHeaderOffset(bitness);
+  const std::array<std::uint8_t, 8> sectionName{'.', 't', 'e', 's', 't', 0};
+  for (std::size_t i = 0; i < sectionName.size(); ++i) {
+    pe[sectionHeader + i] = sectionName[i];
+  }
+  put32(pe,
+        sectionHeader + offsetof(image_section_header, Misc.VirtualSize),
+        kSectionRawSize);
+  put32(pe,
+        sectionHeader + offsetof(image_section_header, VirtualAddress),
+        kImportSectionRva);
+  put32(pe,
+        sectionHeader + offsetof(image_section_header, SizeOfRawData),
+        sectionRawSize);
+  put32(pe,
+        sectionHeader + offsetof(image_section_header, PointerToRawData),
+        kImportSectionRawOffset);
+
+  return pe;
+}
+
+ParsedPePtr parseImportPe(std::vector<std::uint8_t> &pe,
+                          std::uint32_t parseSize = 0) {
+  const auto size = parseSize == 0 ? static_cast<std::uint32_t>(pe.size())
+                                   : parseSize;
+  return ParsedPePtr(ParsePEFromPointer(pe.data(), size),
+                     DestructParsedPE);
+}
+
+void putImportDescriptor(std::vector<std::uint8_t> &pe,
+                         std::uint32_t descriptorOffset,
+                         std::uint32_t lookupRva,
+                         std::uint32_t nameRva,
+                         std::uint32_t addressRva) {
+  const auto fileOffset = fileOffsetForImportRva(
+      rvaForImportOffset(descriptorOffset));
+  put32(pe,
+        fileOffset + offsetof(import_dir_entry, LookupTableRVA),
+        lookupRva);
+  put32(pe, fileOffset + offsetof(import_dir_entry, TimeStamp), 0);
+  put32(pe, fileOffset + offsetof(import_dir_entry, ForwarderChain), 0);
+  put32(pe, fileOffset + offsetof(import_dir_entry, NameRVA), nameRva);
+  put32(pe,
+        fileOffset + offsetof(import_dir_entry, AddressRVA),
+        addressRva);
+}
+
+std::vector<std::uint8_t>
+makeTruncatedImportPe(Bitness bitness,
+                      ImportTarget target,
+                      BoundaryEnd boundaryEnd,
+                      bool completeAtBoundary) {
+  const auto width = targetStructWidth(bitness, target);
+  const auto targetOffset = kSectionRawSize - kImportGuardSize;
+  const auto sectionEnd = targetOffset + (completeAtBoundary ? width
+                                                             : width - 1);
+
+  const auto sectionRawSize = sectionEnd;
+  const auto backingSize = kFileSize;
+
+  auto pe = makeMinimalImportPe(bitness, sectionRawSize, backingSize);
+
+  for (std::uint32_t i = kImportSectionRawOffset; i < backingSize; ++i) {
+    pe[i] = 0xcd;
+  }
+
+  const auto lookupRva = rvaForImportOffset(kImportLookupTableOffset);
+  const auto addressRva = rvaForImportOffset(kImportAddressTableOffset);
+  const auto moduleRva = rvaForImportOffset(kImportModuleOffset);
+  const auto symbolRva = rvaForImportOffset(kImportSymbolOffset);
+
+  putCString(pe,
+             fileOffsetForImportRva(symbolRva) + sizeof(std::uint16_t),
+             "ValidSymbol");
+  putCString(pe, fileOffsetForImportRva(moduleRva), "VALID.DLL");
+
+  if (bitness == Bitness::Pe32) {
+    put32(pe, fileOffsetForImportRva(lookupRva), symbolRva);
+    put32(pe, fileOffsetForImportRva(lookupRva) + sizeof(std::uint32_t), 0);
+    put32(pe, fileOffsetForImportRva(addressRva), symbolRva);
+    put32(pe, fileOffsetForImportRva(addressRva) + sizeof(std::uint32_t), 0);
+  } else {
+    put64(pe, fileOffsetForImportRva(lookupRva), symbolRva);
+    put64(pe,
+          fileOffsetForImportRva(lookupRva) + sizeof(std::uint64_t),
+          0);
+    put64(pe, fileOffsetForImportRva(addressRva), symbolRva);
+    put64(pe,
+          fileOffsetForImportRva(addressRva) + sizeof(std::uint64_t),
+          0);
+  }
+
+  putImportDescriptor(pe,
+                      kImportValidDescriptorOffset,
+                      lookupRva,
+                      moduleRva,
+                      addressRva);
+
+  const auto targetRva = rvaForImportOffset(targetOffset);
+  switch (target) {
+  case ImportTarget::Descriptor:
+    putImportDataDirectory(pe,
+                           bitness,
+                           DIR_IMPORT,
+                           targetRva,
+                           static_cast<std::uint32_t>(width * 2));
+    if (completeAtBoundary) {
+      std::fill(pe.begin() + fileOffsetForImportRva(targetRva),
+                pe.begin() + fileOffsetForImportRva(targetRva) + width,
+                0);
+    }
+    break;
+  case ImportTarget::Name:
+    putImportDataDirectory(pe,
+                           bitness,
+                           DIR_IMPORT,
+                           kImportSectionRva,
+                           sizeof(import_dir_entry) * 3);
+    putImportDescriptor(pe,
+                        kImportBoundaryDescriptorOffset,
+                        lookupRva,
+                        targetRva,
+                        addressRva);
+    if (completeAtBoundary) {
+      pe[fileOffsetForImportRva(targetRva)] = 0;
+    }
+    break;
+  case ImportTarget::Thunk:
+    putImportDataDirectory(pe,
+                           bitness,
+                           DIR_IMPORT,
+                           kImportSectionRva,
+                           sizeof(import_dir_entry) * 3);
+    putImportDescriptor(pe,
+                        kImportBoundaryDescriptorOffset,
+                        targetRva,
+                        moduleRva,
+                        addressRva);
+    if (completeAtBoundary) {
+      if (bitness == Bitness::Pe32) {
+        put32(pe, fileOffsetForImportRva(targetRva), 0);
+      } else {
+        put64(pe, fileOffsetForImportRva(targetRva), 0);
+      }
+    }
+    break;
+  }
+
+  if (completeAtBoundary && target != ImportTarget::Descriptor) {
+    std::fill(pe.begin() +
+                  fileOffsetForImportRva(
+                      rvaForImportOffset(kImportDescriptorTerminatorOffset)),
+              pe.begin() +
+                  fileOffsetForImportRva(
+                      rvaForImportOffset(kImportDescriptorTerminatorOffset +
+                                         sizeof(import_dir_entry))),
+              0);
+  }
+
+  return pe;
+}
+
+int captureImport(void *ctx,
+                  const VA &addr,
+                  const std::string &moduleName,
+                  const std::string &symbolName) {
+  auto *imports = static_cast<std::vector<ImportInfo> *>(ctx);
+  imports->push_back({addr, moduleName, symbolName});
+  return 0;
+}
+
+std::uint32_t importSampleParseSize(Bitness bitness,
+                                    ImportTarget target,
+                                    BoundaryEnd boundaryEnd,
+                                    bool completeAtBoundary) {
+  if (boundaryEnd == BoundaryEnd::Section) {
+    return kFileSize;
+  }
+
+  const auto width = targetStructWidth(bitness, target);
+  const auto targetOffset = kSectionRawSize - kImportGuardSize;
+  return kImportSectionRawOffset + targetOffset +
+         (completeAtBoundary ? width : width - 1);
+}
+
 int countDebugDirectory(void *ctx,
                         const std::uint32_t &,
                         const bounded_buffer *) {
@@ -631,6 +945,143 @@ TEST_CASE("mixed named and ordinal-only exports are included once",
   REQUIRE(exports[2].ordinal == 1);
   REQUIRE(exports[2].symbolName.empty());
   REQUIRE(exports[2].forwardName == "target.dll.Func");
+}
+
+TEST_CASE("import structures ending exactly at a boundary are accepted",
+          "[imports]") {
+  const auto bitness = GENERATE(Bitness::Pe32, Bitness::Pe32Plus);
+  const auto target =
+      GENERATE(ImportTarget::Descriptor, ImportTarget::Name,
+               ImportTarget::Thunk);
+  const auto boundaryEnd =
+      GENERATE(BoundaryEnd::Section, BoundaryEnd::File);
+
+  auto pe = makeTruncatedImportPe(bitness, target, boundaryEnd, true);
+  const auto sampleParseSize =
+      importSampleParseSize(bitness, target, boundaryEnd, true);
+  auto parsed = parseImportPe(pe, sampleParseSize);
+
+  INFO("bitness=" << static_cast<int>(bitness)
+                       << " target=" << static_cast<int>(target)
+                       << " end=" << static_cast<int>(boundaryEnd) << " "
+                       << GetPEErrString() << " at " << GetPEErrLoc());
+  REQUIRE(parsed);
+
+  std::vector<ImportInfo> imports;
+  IterImpVAString(parsed.get(), captureImport, &imports);
+
+  if (target == ImportTarget::Descriptor) {
+    REQUIRE(imports.empty());
+  } else {
+    REQUIRE(imports.size() == (target == ImportTarget::Name ? 2U : 1U));
+    for (std::size_t i = 0; i < imports.size(); ++i) {
+      REQUIRE(imports[i].moduleName ==
+              (target == ImportTarget::Name && i == imports.size() - 1
+                   ? ""
+                   : "VALID.DLL"));
+      REQUIRE(imports[i].symbolName == "ValidSymbol");
+    }
+
+    const auto imageBase = bitness == Bitness::Pe32 ? 0x400000ULL
+                                                    : 0x140000000ULL;
+    REQUIRE(imports.front().addr ==
+            imageBase + kImportSectionRva + kImportAddressTableOffset);
+  }
+}
+
+TEST_CASE("truncated import structures do not expose forged imports",
+          "[imports]") {
+  const auto bitness = GENERATE(Bitness::Pe32, Bitness::Pe32Plus);
+  const auto target =
+      GENERATE(ImportTarget::Descriptor, ImportTarget::Name,
+               ImportTarget::Thunk);
+  const auto boundaryEnd =
+      GENERATE(BoundaryEnd::Section, BoundaryEnd::File);
+
+  for (int iteration = 0; iteration < 5; ++iteration) {
+    auto pe = makeTruncatedImportPe(bitness, target, boundaryEnd, false);
+    auto parsed = parseImportPe(
+        pe,
+        importSampleParseSize(bitness, target, boundaryEnd, false));
+
+    INFO("iteration=" << iteration << " " << GetPEErrString() << " at "
+                      << GetPEErrLoc());
+    REQUIRE_FALSE(parsed);
+
+    std::vector<ImportInfo> imports;
+    REQUIRE(imports.empty());
+  }
+}
+
+TEST_CASE("maximum import RVAs cannot create integer-boundary aliases",
+          "[imports]") {
+  const auto bitness = GENERATE(Bitness::Pe32, Bitness::Pe32Plus);
+  constexpr std::uint32_t kMaxRva =
+      std::numeric_limits<std::uint32_t>::max();
+
+  SECTION("module name RVA") {
+    auto pe = makeMinimalImportPe(bitness, kSectionRawSize);
+    const auto lookupRva = rvaForImportOffset(kImportLookupTableOffset);
+    const auto addressRva = rvaForImportOffset(kImportAddressTableOffset);
+
+    putImportDescriptor(pe,
+                        0,
+                        lookupRva,
+                        kMaxRva,
+                        addressRva);
+    putImportDataDirectory(pe,
+                           bitness,
+                           DIR_IMPORT,
+                           kImportSectionRva,
+                           sizeof(import_dir_entry) * 2);
+
+    auto parsed = parseImportPe(pe);
+    REQUIRE_FALSE(parsed);
+  }
+
+  SECTION("lookup table RVA") {
+    auto pe = makeMinimalImportPe(bitness, kSectionRawSize);
+    const auto moduleRva = rvaForImportOffset(kImportModuleOffset);
+    const auto addressRva = rvaForImportOffset(kImportAddressTableOffset);
+
+    putCString(pe, fileOffsetForImportRva(moduleRva), "VALID.DLL");
+    putImportDescriptor(pe, 0, kMaxRva, moduleRva, addressRva);
+    putImportDataDirectory(pe,
+                           bitness,
+                           DIR_IMPORT,
+                           kImportSectionRva,
+                           sizeof(import_dir_entry) * 2);
+
+    auto parsed = parseImportPe(pe);
+    REQUIRE_FALSE(parsed);
+  }
+
+  SECTION("thunk value") {
+    auto pe = makeMinimalImportPe(bitness, kSectionRawSize);
+    const auto lookupRva = rvaForImportOffset(kImportLookupTableOffset);
+    const auto addressRva = rvaForImportOffset(kImportAddressTableOffset);
+    const auto moduleRva = rvaForImportOffset(kImportModuleOffset);
+
+    putCString(pe, fileOffsetForImportRva(moduleRva), "VALID.DLL");
+    putImportDescriptor(pe, 0, lookupRva, moduleRva, addressRva);
+    putImportDataDirectory(pe,
+                           bitness,
+                           DIR_IMPORT,
+                           kImportSectionRva,
+                           sizeof(import_dir_entry) * 2);
+
+    put32(pe,
+          fileOffsetForImportRva(lookupRva),
+          kMaxRva & ~std::uint32_t{0x80000000});
+  if (bitness == Bitness::Pe32Plus) {
+    put32(pe,
+          fileOffsetForImportRva(lookupRva) + sizeof(std::uint32_t),
+          0);
+  }
+
+    auto parsed = parseImportPe(pe);
+    REQUIRE_FALSE(parsed);
+  }
 }
 
 } // namespace peparse
