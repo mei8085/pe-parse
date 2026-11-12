@@ -25,6 +25,7 @@ add_executable(tests
   corkami_test.cpp
   directory_bounds_test.cpp
   pr_153_test.cpp
+  resource_name_test.cpp
 
   filesystem_compat.h
   )

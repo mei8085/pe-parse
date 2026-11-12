@@ -26,19 +26,37 @@ THE SOFTWARE.
 #include <unicode/ustring.h>
 #include <unicode/utypes.h>
 
+#include <cstdint>
+#include <limits>
+
 namespace peparse {
 std::string from_utf16(const UCharString &u) {
   if (u.empty()) {
     return std::string();
   }
 
+  // ICU lengths are int32_t. Reject inputs that would truncate when
+  // narrowed instead of converting a wrapped length.
+  if (u.size() >
+      static_cast<std::size_t>((std::numeric_limits<std::int32_t>::max)())) {
+    return std::string();
+  }
+
   const UChar *src = reinterpret_cast<const UChar *>(u.data());
   int32_t srcLength = static_cast<int32_t>(u.size());
+
+  /*
+   * Convert with an explicit source length so the operation stays bounded
+   * by the declared code units: embedded NUL code units are preserved and
+   * a truncated surrogate pair is substituted with U+FFFD (matching the
+   * Windows conversion path) instead of pulling in bytes past the end.
+   */
 
   // First pass: determine required buffer size
   UErrorCode status = U_ZERO_ERROR;
   int32_t destLength = 0;
-  u_strToUTF8(nullptr, 0, &destLength, src, srcLength, &status);
+  u_strToUTF8WithSub(
+      nullptr, 0, &destLength, src, srcLength, 0xFFFD, nullptr, &status);
 
   if (status != U_BUFFER_OVERFLOW_ERROR && U_FAILURE(status)) {
     return std::string(); // Return empty on error (matches current behavior)
@@ -47,7 +65,14 @@ std::string from_utf16(const UCharString &u) {
   // Second pass: perform actual conversion
   std::string result(static_cast<std::size_t>(destLength), '\0');
   status = U_ZERO_ERROR;
-  u_strToUTF8(&result[0], destLength, nullptr, src, srcLength, &status);
+  u_strToUTF8WithSub(&result[0],
+                     destLength,
+                     nullptr,
+                     src,
+                     srcLength,
+                     0xFFFD,
+                     nullptr,
+                     &status);
 
   if (U_FAILURE(status)) {
     return std::string();

@@ -745,22 +745,57 @@ void IterRsrc(parsed_pe *pe, iterRsrc cb, void *cbd) {
 bool parse_resource_id(bounded_buffer *data,
                        std::uint32_t id,
                        std::string &result) {
+  if (data == nullptr) {
+    PE_ERR(PEERR_BUFFER);
+    return false;
+  }
+
   std::uint16_t len;
   if (!readWord(data, id, len)) {
     return false;
   }
-  id += 2;
 
-  std::uint32_t rawSize = len * 2U;
-  UCharString rawString;
-  for (std::uint32_t i = 0; i < rawSize; i += 2) {
-    char16_t c;
-    if (!readChar16(data, id + i, c)) {
-      return false;
-    }
-    rawString.push_back(c);
+  /*
+   * A resource name is a counted UTF-16 string: a 16-bit length in code
+   * units (not counting any terminator) immediately followed by the code
+   * units themselves. The length comes straight from the file, so validate
+   * it against the remaining buffer before allocating or converting
+   * anything. This keeps a bogus length from triggering a large allocation
+   * and keeps bytes that follow the string from being read as name content.
+   */
+  const std::uint64_t stringOffset = static_cast<std::uint64_t>(id) + 2;
+  const std::uint64_t byteCount = static_cast<std::uint64_t>(len) * 2;
+
+  if (stringOffset > data->bufLen || byteCount > data->bufLen - stringOffset) {
+    PE_ERR(PEERR_READ);
+    err_loc += " resource string offset=0x" +
+               to_string<std::uint32_t>(id, std::hex);
+    return false;
   }
 
+  static_assert(sizeof(UCharString::value_type) == 2,
+                "UCharString must hold 16-bit code units");
+
+  UCharString rawString(len, 0);
+  if (len != 0) {
+    if (data->swapBytes) {
+      for (std::uint32_t i = 0; i < len; i++) {
+        rawString[i] = static_cast<UCharString::value_type>(
+            (static_cast<std::uint16_t>(data->buf[stringOffset + i * 2]) << 8) |
+            data->buf[stringOffset + i * 2 + 1]);
+      }
+    } else {
+      std::memcpy(&rawString[0],
+                  data->buf + stringOffset,
+                  static_cast<std::size_t>(byteCount));
+    }
+  }
+
+  /*
+   * Bounded, explicit-length conversion: embedded NUL code units are
+   * preserved in the output and a truncated surrogate pair is replaced by
+   * the converter with U+FFFD.
+   */
   result = from_utf16(rawString);
   return true;
 }
@@ -2597,7 +2632,15 @@ parsed_pe *ParsePEFromBuffer(bounded_buffer *buffer) {
   if (!getResources(remaining, file, p->internal->secs, p->internal->rsrcs)) {
     deleteBuffer(remaining);
     DestructParsedPE(p);
-    PE_ERR(PEERR_RESC);
+    /*
+     * The resource parser already recorded the precise failure location,
+     * including the position of the offending resource. Keep that
+     * information and only add this frame as context.
+     */
+    err = PEERR_RESC;
+    err_loc.insert(0,
+                   "ParsePEFromBuffer:" +
+                       to_string<std::uint32_t>(__LINE__, std::dec) + " <- ");
     return nullptr;
   }
 
