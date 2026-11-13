@@ -110,6 +110,27 @@ struct resource {
 };
 
 #ifndef _PEPARSE_WINDOWS_CONFLICTS
+constexpr std::uint16_t WIN_CERT_REVISION_1_0 = 0x0100;
+constexpr std::uint16_t WIN_CERT_REVISION_2_0 = 0x0200;
+constexpr std::uint16_t WIN_CERT_TYPE_X509 = 0x0001;
+constexpr std::uint16_t WIN_CERT_TYPE_PKCS_SIGNED_DATA = 0x0002;
+constexpr std::uint16_t WIN_CERT_TYPE_EFI_PKCS115 = 0x0EF0;
+constexpr std::uint16_t WIN_CERT_TYPE_EFI_GUID = 0x0EF1;
+#endif
+
+struct certificate {
+  // Total WIN_CERTIFICATE length, including its 8-byte header.
+  std::uint32_t length;
+  std::uint16_t revision;
+  std::uint16_t type;
+  // Offset of the complete WIN_CERTIFICATE record in the PE file.
+  std::uint32_t fileOffset;
+  // Complete record bytes, including the header. The parser does not verify
+  // the embedded signature or make any trust decision.
+  bounded_buffer *data;
+};
+
+#ifndef _PEPARSE_WINDOWS_CONFLICTS
 // http://msdn.microsoft.com/en-us/library/ms648009(v=vs.85).aspx
 enum resource_type {
   RT_CURSOR = 1,
@@ -227,6 +248,11 @@ void IterRelocs(parsed_pe *pe, iterReloc cb, void *cbd);
 // iterate over debug directories in the PE file
 typedef int (*iterDebug)(void *, const std::uint32_t &, const bounded_buffer *);
 void IterDebugs(parsed_pe *pe, iterDebug cb, void *cbd);
+
+// iterate over attribute certificate records in the PE file
+typedef int (*iterCertificate)(void *, const certificate &);
+// The security data directory uses file offsets, not RVAs.
+void IterCertificates(parsed_pe *pe, iterCertificate cb, void *cbd);
 
 // Iterate over symbols (symbol table) in the PE file
 typedef int (*iterSymbol)(void *,

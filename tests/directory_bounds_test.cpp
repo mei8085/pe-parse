@@ -19,7 +19,11 @@ constexpr std::uint32_t kSectionRawOffset = 0x200;
 constexpr std::uint32_t kSectionRawSize = 0x1200;
 constexpr std::uint32_t kDebugDirectoryRva = 0x2f50;
 constexpr std::uint32_t kDebugDataRva = 0x2fa4;
-constexpr std::size_t kFileSize = kSectionRawOffset + kSectionRawSize;
+constexpr std::uint32_t kCertificateDirectoryOffset = 0x1400;
+constexpr std::size_t kFileSize = 0x1800;
+constexpr std::uint16_t kCertificateRevision1 = 0x0100;
+constexpr std::uint16_t kCertificateRevision2 = 0x0200;
+constexpr std::uint16_t kPkcsSignedDataType = 0x0002;
 
 using TestPe = std::array<std::uint8_t, kFileSize>;
 using ParsedPePtr = std::unique_ptr<parsed_pe, void (*)(parsed_pe *)>;
@@ -29,6 +33,14 @@ struct ExportInfo {
   std::uint16_t ordinal;
   std::string symbolName;
   std::string forwardName;
+};
+
+struct CertificateInfo {
+  std::uint32_t length;
+  std::uint16_t revision;
+  std::uint16_t type;
+  std::uint32_t fileOffset;
+  std::vector<std::uint8_t> data;
 };
 
 template <typename T>
@@ -189,6 +201,33 @@ ParsedPePtr parse(TestPe &pe) {
       DestructParsedPE);
 }
 
+ParsedPePtr parseBytes(const std::vector<std::uint8_t> &pe) {
+  return ParsedPePtr(
+      ParsePEFromPointer(const_cast<std::uint8_t *>(pe.data()),
+                         static_cast<std::uint32_t>(pe.size())),
+      DestructParsedPE);
+}
+
+void putCertificateRecord(TestPe &pe,
+                          std::uint32_t offset,
+                          std::uint32_t length,
+                          std::uint16_t revision,
+                          std::uint16_t type,
+                          std::uint8_t payload) {
+  put32(pe, offset, length);
+  put16(pe, offset + 4, revision);
+  put16(pe, offset + 6, type);
+  for (std::uint32_t i = 8; i < length; ++i) {
+    pe[offset + i] = payload;
+  }
+}
+
+void putCertificateDirectory(TestPe &pe,
+                              std::uint32_t offset,
+                              std::uint32_t size) {
+  putDataDirectory(pe, DIR_SECURITY, offset, size);
+}
+
 int countDebugDirectory(void *ctx,
                         const std::uint32_t &,
                         const bounded_buffer *) {
@@ -202,6 +241,17 @@ int captureDebugDataSize(void *ctx,
                          const bounded_buffer *data) {
   auto *sizes = static_cast<std::vector<std::uint32_t> *>(ctx);
   sizes->push_back(data->bufLen);
+  return 0;
+}
+
+int captureCertificate(void *ctx, const certificate &certificate) {
+  auto *certificates = static_cast<std::vector<CertificateInfo> *>(ctx);
+  certificates->push_back({certificate.length,
+                           certificate.revision,
+                           certificate.type,
+                           certificate.fileOffset,
+                           {certificate.data->buf,
+                            certificate.data->buf + certificate.data->bufLen}});
   return 0;
 }
 
@@ -311,6 +361,180 @@ TEST_CASE("overflowing debug directory data range is skipped", "[debug]") {
   std::size_t debugDirectoryCount = 0;
   IterDebugs(p.get(), countDebugDirectory, &debugDirectoryCount);
   REQUIRE(debugDirectoryCount == 0);
+}
+
+TEST_CASE("certificate directory is parsed using file offsets",
+          "[certificates]") {
+  auto pe = makeMinimalPe();
+  constexpr std::uint32_t kFirstLength = 12;
+  constexpr std::uint32_t kSecondLength = 16;
+  constexpr std::uint32_t kDirectorySize = 32;
+
+  putCertificateDirectory(pe, kCertificateDirectoryOffset, kDirectorySize);
+  putCertificateRecord(pe,
+                       kCertificateDirectoryOffset,
+                       kFirstLength,
+                       kCertificateRevision2,
+                       kPkcsSignedDataType,
+                       0xa1);
+  putCertificateRecord(pe,
+                       kCertificateDirectoryOffset + 16,
+                       kSecondLength,
+                       kCertificateRevision1,
+                       0x7fff,
+                       0xb2);
+
+  auto p = parse(pe);
+  INFO(GetPEErrString() << " at " << GetPEErrLoc());
+  REQUIRE(p);
+
+  std::vector<CertificateInfo> certificates;
+  IterCertificates(p.get(), captureCertificate, &certificates);
+
+  REQUIRE(certificates.size() == 2);
+  REQUIRE(certificates[0].length == kFirstLength);
+  REQUIRE(certificates[0].revision == kCertificateRevision2);
+  REQUIRE(certificates[0].type == kPkcsSignedDataType);
+  REQUIRE(certificates[0].fileOffset == kCertificateDirectoryOffset);
+  REQUIRE(certificates[0].data.size() == kFirstLength);
+  REQUIRE(certificates[0].data[0] == kFirstLength);
+  REQUIRE(certificates[0].data[8] == 0xa1);
+
+  REQUIRE(certificates[1].length == kSecondLength);
+  REQUIRE(certificates[1].revision == kCertificateRevision1);
+  REQUIRE(certificates[1].type == 0x7fff);
+  REQUIRE(certificates[1].fileOffset == kCertificateDirectoryOffset + 16);
+  REQUIRE(certificates[1].data.size() == kSecondLength);
+  REQUIRE(certificates[1].data[6] == 0xff);
+  REQUIRE(certificates[1].data[8] == 0xb2);
+}
+
+TEST_CASE("certificate records after a truncated record are not emitted",
+          "[certificates]") {
+  auto pe = makeMinimalPe();
+  putCertificateDirectory(pe, kCertificateDirectoryOffset, 24);
+  putCertificateRecord(pe,
+                       kCertificateDirectoryOffset,
+                       12,
+                       kCertificateRevision2,
+                       kPkcsSignedDataType,
+                       0xa1);
+  put32(pe, kCertificateDirectoryOffset + 16, 16);
+
+  auto p = parse(pe);
+  REQUIRE(p);
+
+  std::vector<CertificateInfo> certificates;
+  IterCertificates(p.get(), captureCertificate, &certificates);
+
+  REQUIRE(certificates.size() == 1);
+  REQUIRE(certificates[0].fileOffset == kCertificateDirectoryOffset);
+}
+
+TEST_CASE("certificate parsing preserves valid records before trailing padding",
+          "[certificates]") {
+  auto pe = makeMinimalPe();
+  putCertificateDirectory(pe, kCertificateDirectoryOffset, 24);
+  putCertificateRecord(pe,
+                       kCertificateDirectoryOffset,
+                       12,
+                       kCertificateRevision2,
+                       kPkcsSignedDataType,
+                       0xa1);
+  std::fill(pe.begin() + kCertificateDirectoryOffset + 16,
+            pe.begin() + kCertificateDirectoryOffset + 24,
+            0);
+
+  auto p = parse(pe);
+  REQUIRE(p);
+
+  std::vector<CertificateInfo> certificates;
+  IterCertificates(p.get(), captureCertificate, &certificates);
+
+  REQUIRE(certificates.size() == 1);
+  REQUIRE(certificates[0].fileOffset == kCertificateDirectoryOffset);
+  REQUIRE(certificates[0].length == 12);
+}
+
+TEST_CASE("malicious certificate lengths stay within the file and directory",
+          "[certificates]") {
+  auto pe = makeMinimalPe();
+  putCertificateDirectory(pe, kFileSize - 8, 8);
+  put32(pe, kFileSize - 8, std::numeric_limits<std::uint32_t>::max());
+
+  auto p = parse(pe);
+  REQUIRE(p);
+
+  std::vector<CertificateInfo> certificates;
+  IterCertificates(p.get(), captureCertificate, &certificates);
+  REQUIRE(certificates.empty());
+
+  std::vector<std::uint8_t> rawEntry;
+  REQUIRE(GetDataDirectoryEntry(p.get(), DIR_SECURITY, rawEntry));
+  REQUIRE(rawEntry.size() == 8);
+}
+
+TEST_CASE("certificate record can end exactly at the file boundary",
+          "[certificates]") {
+  auto pe = makeMinimalPe();
+  putCertificateDirectory(pe, kFileSize - 8, 8);
+  put32(pe, kFileSize - 8, 8);
+  put16(pe, kFileSize - 4, kCertificateRevision2);
+  put16(pe, kFileSize - 2, kPkcsSignedDataType);
+
+  auto p = parse(pe);
+  REQUIRE(p);
+
+  std::vector<CertificateInfo> certificates;
+  IterCertificates(p.get(), captureCertificate, &certificates);
+
+  REQUIRE(certificates.size() == 1);
+  REQUIRE(certificates[0].length == 8);
+  REQUIRE(certificates[0].fileOffset == kFileSize - 8);
+  REQUIRE(certificates[0].data.size() == 8);
+
+  std::vector<std::uint8_t> rawEntry;
+  REQUIRE(GetDataDirectoryEntry(p.get(), DIR_SECURITY, rawEntry));
+  REQUIRE(rawEntry.size() == 8);
+}
+
+TEST_CASE("certificate directory extending past the file produces no records",
+          "[certificates]") {
+  auto pe = makeMinimalPe();
+  putCertificateDirectory(pe, kFileSize - 8, 16);
+  put32(pe, kFileSize - 8, 8);
+  put16(pe, kFileSize - 4, kCertificateRevision2);
+  put16(pe, kFileSize - 2, kPkcsSignedDataType);
+
+  auto p = parse(pe);
+  REQUIRE(p);
+
+  std::vector<CertificateInfo> certificates;
+  IterCertificates(p.get(), captureCertificate, &certificates);
+  REQUIRE(certificates.empty());
+
+  std::vector<std::uint8_t> rawEntry;
+  REQUIRE_FALSE(GetDataDirectoryEntry(p.get(), DIR_SECURITY, rawEntry));
+  REQUIRE(rawEntry.empty());
+}
+
+TEST_CASE("truncated certificate directory input has bounded results",
+          "[certificates]") {
+  auto pe = makeMinimalPe();
+  putCertificateDirectory(pe, kFileSize - 8, 16);
+  put32(pe, kFileSize - 8, 12);
+
+  std::vector<std::uint8_t> truncated(pe.begin(), pe.end() - 4);
+  auto p = parseBytes(truncated);
+  REQUIRE(p);
+
+  std::vector<CertificateInfo> certificates;
+  IterCertificates(p.get(), captureCertificate, &certificates);
+  REQUIRE(certificates.empty());
+
+  std::vector<std::uint8_t> rawEntry;
+  REQUIRE_FALSE(GetDataDirectoryEntry(p.get(), DIR_SECURITY, rawEntry));
+  REQUIRE(rawEntry.empty());
 }
 
 TEST_CASE("data directory entry can end at section boundary",

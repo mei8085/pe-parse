@@ -82,6 +82,14 @@ struct debugent {
   bounded_buffer *data;
 };
 
+struct certificateent {
+  std::uint32_t length;
+  std::uint16_t revision;
+  std::uint16_t type;
+  std::uint32_t fileOffset;
+  bounded_buffer *data;
+};
+
 #define SYMBOL_NAME_OFFSET(sn) (static_cast<std::uint32_t>(sn.data >> 32))
 #define SYMBOL_TYPE_HI(x) (x.type >> 8)
 
@@ -145,6 +153,7 @@ struct parsed_pe_internal {
   std::vector<exportent> exports;
   std::vector<symbol> symbols;
   std::vector<debugent> debugdirs;
+  std::vector<certificateent> certificates;
 };
 
 // String representation of Rich header object types
@@ -1989,6 +1998,92 @@ bool getDebugDir(parsed_pe *p) {
   return true;
 }
 
+bool getCertificates(parsed_pe *p) {
+  data_directory certificateDir;
+  if (p->peHeader.nt.OptionalMagic == NT_OPTIONAL_32_MAGIC) {
+    certificateDir =
+        p->peHeader.nt.OptionalHeader.DataDirectory[DIR_SECURITY];
+  } else if (p->peHeader.nt.OptionalMagic == NT_OPTIONAL_64_MAGIC) {
+    certificateDir =
+        p->peHeader.nt.OptionalHeader64.DataDirectory[DIR_SECURITY];
+  } else {
+    return false;
+  }
+
+  if (certificateDir.VirtualAddress == 0 || certificateDir.Size == 0) {
+    return true;
+  }
+
+  const std::uint64_t directoryStart = certificateDir.VirtualAddress;
+  const std::uint64_t directorySize = certificateDir.Size;
+  const std::uint64_t fileSize = p->fileBuffer->bufLen;
+
+  // The security directory is file-backed. Do not emit records when its
+  // declaration reaches beyond the available input.
+  if (directoryStart > fileSize ||
+      directorySize > fileSize - directoryStart) {
+    return true;
+  }
+
+  const std::uint64_t directoryEnd = directoryStart + directorySize;
+  std::uint64_t currentOffset = directoryStart;
+
+  while (currentOffset < directoryEnd) {
+    // Records that cannot provide a complete length and header are treated as
+    // trailing truncation, not as valid certificates.
+    if (directoryEnd - currentOffset < sizeof(std::uint32_t)) {
+      break;
+    }
+
+    std::uint32_t recordLength;
+    if (!readDword(p->fileBuffer,
+                   static_cast<std::uint32_t>(currentOffset),
+                   recordLength)) {
+      break;
+    }
+
+    if (recordLength < 8 || recordLength > directoryEnd - currentOffset) {
+      break;
+    }
+
+    std::uint16_t revision;
+    std::uint16_t type;
+    if (!readWord(p->fileBuffer,
+                  static_cast<std::uint32_t>(currentOffset + 4),
+                  revision) ||
+        !readWord(p->fileBuffer,
+                  static_cast<std::uint32_t>(currentOffset + 6),
+                  type)) {
+      break;
+    }
+
+    bounded_buffer *recordData = splitBufferByLength(
+        p->fileBuffer,
+        static_cast<std::uint32_t>(currentOffset),
+        recordLength);
+    if (recordData == nullptr) {
+      break;
+    }
+
+    certificateent entry;
+    entry.length = recordLength;
+    entry.revision = revision;
+    entry.type = type;
+    entry.fileOffset = static_cast<std::uint32_t>(currentOffset);
+    entry.data = recordData;
+    p->internal->certificates.push_back(entry);
+
+    const std::uint64_t unalignedNextOffset = currentOffset + recordLength;
+    currentOffset =
+        (unalignedNextOffset + 7U) & ~static_cast<std::uint64_t>(7);
+    if (currentOffset < unalignedNextOffset || currentOffset > directoryEnd) {
+      break;
+    }
+  }
+
+  return true;
+}
+
 bool getImports(parsed_pe *p) {
   data_directory importDir;
   if (p->peHeader.nt.OptionalMagic == NT_OPTIONAL_32_MAGIC) {
@@ -2624,6 +2719,13 @@ parsed_pe *ParsePEFromBuffer(bounded_buffer *buffer) {
     return nullptr;
   }
 
+  if (!getCertificates(p)) {
+    deleteBuffer(remaining);
+    DestructParsedPE(p);
+    PE_ERR(PEERR_MAGIC);
+    return nullptr;
+  }
+
   // Get imports
   if (!getImports(p)) {
     deleteBuffer(remaining);
@@ -2689,6 +2791,12 @@ void DestructParsedPE(parsed_pe *p) {
     }
   }
 
+  for (certificateent c : p->internal->certificates) {
+    if (c.data != nullptr) {
+      deleteBuffer(c.data);
+    }
+  }
+
   delete p->internal;
   delete p;
   return;
@@ -2725,6 +2833,23 @@ void IterDebugs(parsed_pe *pe, iterDebug cb, void *cbd) {
 
   for (debugent &d : l) {
     if (cb(cbd, d.type, d.data) != 0) {
+      break;
+    }
+  }
+}
+
+void IterCertificates(parsed_pe *pe, iterCertificate cb, void *cbd) {
+  std::vector<certificateent> &l = pe->internal->certificates;
+
+  for (certificateent &c : l) {
+    certificate record;
+    record.length = c.length;
+    record.revision = c.revision;
+    record.type = c.type;
+    record.fileOffset = c.fileOffset;
+    record.data = c.data;
+
+    if (cb(cbd, record) != 0) {
       break;
     }
   }

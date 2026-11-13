@@ -16,6 +16,7 @@ pe-parse supports these use cases via a minimal API that provides methods for
  * Iterating over the exported functions
  * Iterating over sections
  * Iterating over resources
+ * Iterating over attribute certificate records
  * Reading bytes from specified virtual addresses
  * Retrieving the program entry point
 
