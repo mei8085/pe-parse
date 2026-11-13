@@ -77,6 +77,23 @@ struct reloc {
   reloc_type type;
 };
 
+static bool checkedRelocationVA(VA imageBase,
+                                std::uint32_t pageRVA,
+                                std::uint16_t offset,
+                                VA &relocationVA) {
+  if (imageBase > std::numeric_limits<VA>::max() - pageRVA) {
+    return false;
+  }
+
+  VA pageVA = imageBase + pageRVA;
+  if (pageVA > std::numeric_limits<VA>::max() - offset) {
+    return false;
+  }
+
+  relocationVA = pageVA + offset;
+  return true;
+}
+
 struct debugent {
   std::uint32_t type;
   bounded_buffer *data;
@@ -1789,10 +1806,13 @@ bool getExports(parsed_pe *p) {
 
 bool getRelocations(parsed_pe *p) {
   data_directory relocDir;
+  VA imageBase;
   if (p->peHeader.nt.OptionalMagic == NT_OPTIONAL_32_MAGIC) {
     relocDir = p->peHeader.nt.OptionalHeader.DataDirectory[DIR_BASERELOC];
+    imageBase = p->peHeader.nt.OptionalHeader.ImageBase;
   } else if (p->peHeader.nt.OptionalMagic == NT_OPTIONAL_64_MAGIC) {
     relocDir = p->peHeader.nt.OptionalHeader64.DataDirectory[DIR_BASERELOC];
+    imageBase = p->peHeader.nt.OptionalHeader64.ImageBase;
   } else {
     return false;
   }
@@ -1800,13 +1820,8 @@ bool getRelocations(parsed_pe *p) {
   if (relocDir.Size != 0) {
     section d;
     VA vaAddr;
-    if (p->peHeader.nt.OptionalMagic == NT_OPTIONAL_32_MAGIC) {
-      vaAddr =
-          relocDir.VirtualAddress + p->peHeader.nt.OptionalHeader.ImageBase;
-    } else if (p->peHeader.nt.OptionalMagic == NT_OPTIONAL_64_MAGIC) {
-      vaAddr =
-          relocDir.VirtualAddress + p->peHeader.nt.OptionalHeader64.ImageBase;
-    } else {
+    if (!checkedRelocationVA(
+            imageBase, relocDir.VirtualAddress, 0, vaAddr)) {
       return false;
     }
 
@@ -1814,21 +1829,47 @@ bool getRelocations(parsed_pe *p) {
       return false;
     }
 
-    auto rvaofft = static_cast<std::uint32_t>(vaAddr - d.sectionBase);
+    const auto directoryOffset =
+        static_cast<std::uint32_t>(vaAddr - d.sectionBase);
+    const std::uint64_t directoryEnd =
+        static_cast<std::uint64_t>(directoryOffset) + relocDir.Size;
+    if (directoryEnd > d.sectionData->bufLen) {
+      PE_ERR(PEERR_ADDRESS);
+      return false;
+    }
 
-    while (rvaofft < relocDir.Size) {
+    std::uint32_t currentOffset = directoryOffset;
+    std::uint32_t remainingSize = relocDir.Size;
+
+    while (remainingSize != 0) {
+      if (remainingSize < sizeof(reloc_block)) {
+        PE_ERR(PEERR_SIZE);
+        return false;
+      }
+
       std::uint32_t pageRva;
       std::uint32_t blockSize;
 
       if (!readDword(d.sectionData,
-                     rvaofft + offsetof(reloc_block, PageRVA),
+                     currentOffset + offsetof(reloc_block, PageRVA),
                      pageRva)) {
         return false;
       }
 
       if (!readDword(d.sectionData,
-                     rvaofft + offsetof(reloc_block, BlockSize),
+                     currentOffset + offsetof(reloc_block, BlockSize),
                      blockSize)) {
+        return false;
+      }
+
+      if (blockSize < sizeof(reloc_block) || blockSize > remainingSize) {
+        PE_ERR(PEERR_SIZE);
+        return false;
+      }
+
+      const std::uint32_t payloadSize = blockSize - sizeof(reloc_block);
+      if ((payloadSize % sizeof(std::uint16_t)) != 0) {
+        PE_ERR(PEERR_SIZE);
         return false;
       }
 
@@ -1836,10 +1877,10 @@ bool getRelocations(parsed_pe *p) {
       // including the Page RVA and Block Size fields and the Type/Offset fields
       // that follow. Therefore we should subtract 8 bytes from BlockSize to
       // exclude the Page RVA and Block Size fields.
-      std::uint32_t entryCount = (blockSize - 8) / sizeof(std::uint16_t);
+      std::uint32_t entryCount = payloadSize / sizeof(std::uint16_t);
 
       // Skip the Page RVA and Block Size fields
-      rvaofft += sizeof(reloc_block);
+      currentOffset += sizeof(reloc_block);
 
       // Iterate over all of the block Type/Offset entries
       while (entryCount != 0) {
@@ -1847,7 +1888,7 @@ bool getRelocations(parsed_pe *p) {
         std::uint8_t type;
         std::uint16_t offset;
 
-        if (!readWord(d.sectionData, rvaofft, entry)) {
+        if (!readWord(d.sectionData, currentOffset, entry)) {
           return false;
         }
 
@@ -1856,14 +1897,16 @@ bool getRelocations(parsed_pe *p) {
         // Mask out the offset and assign
         offset = entry & static_cast<std::uint16_t>(~0xf000);
 
+        if (type == RELOC_ABSOLUTE) {
+          entryCount--;
+          currentOffset += sizeof(std::uint16_t);
+          continue;
+        }
+
         // Produce the VA of the relocation
         VA relocVA;
-        if (p->peHeader.nt.OptionalMagic == NT_OPTIONAL_32_MAGIC) {
-          relocVA = pageRva + offset + p->peHeader.nt.OptionalHeader.ImageBase;
-        } else if (p->peHeader.nt.OptionalMagic == NT_OPTIONAL_64_MAGIC) {
-          relocVA =
-              pageRva + offset + p->peHeader.nt.OptionalHeader64.ImageBase;
-        } else {
+        if (!checkedRelocationVA(imageBase, pageRva, offset, relocVA)) {
+          PE_ERR(PEERR_ADDRESS);
           return false;
         }
 
@@ -1875,8 +1918,10 @@ bool getRelocations(parsed_pe *p) {
         p->internal->relocs.push_back(r);
 
         entryCount--;
-        rvaofft += sizeof(std::uint16_t);
+        currentOffset += sizeof(std::uint16_t);
       }
+
+      remainingSize -= blockSize;
     }
   }
 

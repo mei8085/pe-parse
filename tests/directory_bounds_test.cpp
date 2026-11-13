@@ -31,6 +31,11 @@ struct ExportInfo {
   std::string forwardName;
 };
 
+struct RelocInfo {
+  VA addr;
+  reloc_type type;
+};
+
 template <typename T>
 void put16(T &buffer, std::size_t offset, std::uint16_t value) {
   buffer[offset] = static_cast<std::uint8_t>(value);
@@ -43,6 +48,13 @@ void put32(T &buffer, std::size_t offset, std::uint32_t value) {
   buffer[offset + 1] = static_cast<std::uint8_t>(value >> 8);
   buffer[offset + 2] = static_cast<std::uint8_t>(value >> 16);
   buffer[offset + 3] = static_cast<std::uint8_t>(value >> 24);
+}
+
+template <typename T>
+void put64(T &buffer, std::size_t offset, std::uint64_t value) {
+  for (std::size_t i = 0; i < sizeof(value); ++i) {
+    buffer[offset + i] = static_cast<std::uint8_t>(value >> (8 * i));
+  }
 }
 
 template <typename T>
@@ -61,8 +73,18 @@ constexpr std::size_t sectionHeaderOffset() {
   return optionalHeaderOffset() + sizeof(optional_header_32);
 }
 
+constexpr std::size_t sectionHeader64Offset() {
+  return optionalHeaderOffset() + sizeof(optional_header_64);
+}
+
 constexpr std::size_t dataDirectoryOffset(data_directory_kind kind) {
   return optionalHeaderOffset() + offsetof(optional_header_32, DataDirectory) +
+         (static_cast<std::size_t>(kind) * sizeof(data_directory));
+}
+
+constexpr std::size_t dataDirectory64Offset(data_directory_kind kind) {
+  return optionalHeaderOffset() +
+         offsetof(optional_header_64, DataDirectory) +
          (static_cast<std::size_t>(kind) * sizeof(data_directory));
 }
 
@@ -75,19 +97,30 @@ void putDataDirectory(TestPe &pe,
   put32(pe, offset + offsetof(data_directory, Size), size);
 }
 
-std::uint32_t sectionEndRva() {
+void putDataDirectory64(TestPe &pe,
+                        data_directory_kind kind,
+                        std::uint32_t virtualAddress,
+                        std::uint32_t size) {
+  const auto offset = dataDirectory64Offset(kind);
+  put32(pe, offset + offsetof(data_directory, VirtualAddress), virtualAddress);
+  put32(pe, offset + offsetof(data_directory, Size), size);
+}
+
+constexpr std::uint32_t sectionEndRva() {
   return kSectionRva + kSectionRawSize;
 }
 
-std::size_t sectionOffset(std::uint32_t rva) {
+constexpr std::size_t sectionOffset(std::uint32_t rva) {
   return kSectionRawOffset + (rva - kSectionRva);
 }
 
-std::size_t sectionOffset(std::uint32_t sectionRva, std::uint32_t rva) {
+constexpr std::size_t sectionOffset(std::uint32_t sectionRva,
+                                    std::uint32_t rva) {
   return kSectionRawOffset + (rva - sectionRva);
 }
 
-std::uint32_t sectionRvaAt(std::uint32_t sectionRva, std::uint32_t offset) {
+constexpr std::uint32_t sectionRvaAt(std::uint32_t sectionRva,
+                                     std::uint32_t offset) {
   return sectionRva + offset;
 }
 
@@ -97,14 +130,34 @@ std::size_t debugEntryOffset() {
 
 void putSectionRawRange(TestPe &pe,
                         std::uint32_t rawOffset,
-                        std::uint32_t rawSize) {
-  constexpr auto kSectionHeaderOffset = sectionHeaderOffset();
+                        std::uint32_t rawSize,
+                        std::size_t sectionHeaderOffset =
+                            sectionHeaderOffset()) {
   put32(pe,
-        kSectionHeaderOffset + offsetof(image_section_header, SizeOfRawData),
+        sectionHeaderOffset + offsetof(image_section_header, SizeOfRawData),
         rawSize);
   put32(pe,
-        kSectionHeaderOffset + offsetof(image_section_header, PointerToRawData),
+        sectionHeaderOffset +
+            offsetof(image_section_header, PointerToRawData),
         rawOffset);
+}
+
+void putRelocationBlock(TestPe &pe,
+                        std::size_t fileOffset,
+                        std::uint32_t pageRVA,
+                        const std::vector<std::uint16_t> &entries) {
+  put32(pe, fileOffset + offsetof(reloc_block, PageRVA), pageRVA);
+  put32(pe,
+        fileOffset + offsetof(reloc_block, BlockSize),
+        static_cast<std::uint32_t>(sizeof(reloc_block) +
+                                   (entries.size() * sizeof(std::uint16_t))));
+
+  for (std::size_t i = 0; i < entries.size(); ++i) {
+    put16(pe,
+          fileOffset + sizeof(reloc_block) +
+              (i * sizeof(std::uint16_t)),
+          entries[i]);
+  }
 }
 
 void putDebugEntry(TestPe &pe,
@@ -149,7 +202,8 @@ void putExportCString(TestPe &pe,
 }
 
 TestPe makeMinimalPe(std::uint32_t sectionRva = kSectionRva,
-                     std::uint32_t sectionRawSize = kSectionRawSize) {
+                     std::uint32_t sectionRawSize = kSectionRawSize,
+                     std::uint32_t imageBase = 0) {
   TestPe pe{};
 
   put16(pe, offsetof(dos_header, e_magic), MZ_MAGIC);
@@ -167,6 +221,9 @@ TestPe makeMinimalPe(std::uint32_t sectionRva = kSectionRva,
         optionalHeaderOffset() + offsetof(optional_header_32, Magic),
         NT_OPTIONAL_32_MAGIC);
   put32(pe,
+        optionalHeaderOffset() + offsetof(optional_header_32, ImageBase),
+        imageBase);
+  put32(pe,
         optionalHeaderOffset() +
             offsetof(optional_header_32, NumberOfRvaAndSizes),
         NUM_DIR_ENTRIES);
@@ -179,6 +236,46 @@ TestPe makeMinimalPe(std::uint32_t sectionRva = kSectionRva,
         kSectionHeaderOffset + offsetof(image_section_header, VirtualAddress),
         sectionRva);
   putSectionRawRange(pe, kSectionRawOffset, sectionRawSize);
+
+  return pe;
+}
+
+TestPe makeMinimalPe64(std::uint32_t sectionRva = kSectionRva,
+                       std::uint32_t sectionRawSize = kSectionRawSize,
+                       std::uint64_t imageBase = 0x140000000ULL) {
+  TestPe pe{};
+
+  put16(pe, offsetof(dos_header, e_magic), MZ_MAGIC);
+  put32(pe, offsetof(dos_header, e_lfanew), kNtHeaderOffset);
+  put32(pe, kNtHeaderOffset, NT_MAGIC);
+
+  constexpr auto kFileHeaderOffset =
+      kNtHeaderOffset + offsetof(nt_header_32, FileHeader);
+  put16(pe,
+        kFileHeaderOffset + offsetof(file_header, Machine),
+        IMAGE_FILE_MACHINE_AMD64);
+  put16(pe, kFileHeaderOffset + offsetof(file_header, NumberOfSections), 1);
+
+  put16(pe,
+        optionalHeaderOffset() + offsetof(optional_header_64, Magic),
+        NT_OPTIONAL_64_MAGIC);
+  put64(pe,
+        optionalHeaderOffset() + offsetof(optional_header_64, ImageBase),
+        imageBase);
+  put32(pe,
+        optionalHeaderOffset() +
+            offsetof(optional_header_64, NumberOfRvaAndSizes),
+        NUM_DIR_ENTRIES);
+
+  constexpr auto kSectionHeaderOffset = sectionHeader64Offset();
+  put32(pe,
+        kSectionHeaderOffset + offsetof(image_section_header, Misc.VirtualSize),
+        sectionRawSize);
+  put32(pe,
+        kSectionHeaderOffset + offsetof(image_section_header, VirtualAddress),
+        sectionRva);
+  putSectionRawRange(
+      pe, kSectionRawOffset, sectionRawSize, kSectionHeaderOffset);
 
   return pe;
 }
@@ -213,6 +310,12 @@ int captureExport(void *ctx,
                   const std::string &forwardName) {
   auto *exports = static_cast<std::vector<ExportInfo> *>(ctx);
   exports->push_back({addr, ordinal, symbolName, forwardName});
+  return 0;
+}
+
+int captureRelocation(void *ctx, const VA &addr, const reloc_type &type) {
+  auto *relocations = static_cast<std::vector<RelocInfo> *>(ctx);
+  relocations->push_back({addr, type});
   return 0;
 }
 
@@ -297,6 +400,242 @@ TEST_CASE("oversized debug directory data range is skipped", "[debug]") {
   std::size_t debugDirectoryCount = 0;
   IterDebugs(p.get(), countDebugDirectory, &debugDirectoryCount);
   REQUIRE(debugDirectoryCount == 0);
+}
+
+TEST_CASE("32-bit relocations use complete in-file blocks", "[relocations]") {
+  constexpr std::uint32_t kImageBase = 0x00400000;
+  constexpr std::uint32_t kRelocDirectoryRva = kSectionRva + 0x1000;
+  constexpr std::uint32_t kBlockPageRva = 0x2100;
+  constexpr std::uint16_t kHighLowEntry =
+      static_cast<std::uint16_t>((RELOC_HIGHLOW << 12) | 0x0123);
+  constexpr std::uint16_t kAbsoluteEntry = 0x0456;
+  constexpr std::uint16_t kUnknownEntry =
+      static_cast<std::uint16_t>((13 << 12) | 0x0789);
+
+  auto pe = makeMinimalPe(kSectionRva, kSectionRawSize, kImageBase);
+  putDataDirectory(pe,
+                   DIR_BASERELOC,
+                   kRelocDirectoryRva,
+                   sizeof(reloc_block) + (3 * sizeof(std::uint16_t)));
+  putRelocationBlock(pe,
+                     sectionOffset(kRelocDirectoryRva),
+                     kBlockPageRva,
+                     {kHighLowEntry, kAbsoluteEntry, kUnknownEntry});
+
+  auto p = parse(pe);
+  INFO(GetPEErrString() << " at " << GetPEErrLoc());
+  REQUIRE(p);
+
+  std::vector<RelocInfo> relocations;
+  IterRelocs(p.get(), captureRelocation, &relocations);
+
+  REQUIRE(relocations.size() == 2);
+  REQUIRE(relocations[0].addr ==
+          static_cast<VA>(kImageBase) + kBlockPageRva + 0x0123);
+  REQUIRE(relocations[0].type == RELOC_HIGHLOW);
+  REQUIRE(relocations[1].addr ==
+          static_cast<VA>(kImageBase) + kBlockPageRva + 0x0789);
+  REQUIRE(relocations[1].type == static_cast<reloc_type>(13));
+}
+
+TEST_CASE("64-bit relocations use complete in-file blocks", "[relocations]") {
+  constexpr std::uint64_t kImageBase = 0x140000000ULL;
+  constexpr std::uint32_t kRelocDirectoryRva = kSectionRva + 0x1000;
+  constexpr std::uint32_t kBlockPageRva = 0x2400;
+  constexpr std::uint16_t kDir64Entry =
+      static_cast<std::uint16_t>((RELOC_DIR64 << 12) | 0x0abc);
+  constexpr std::uint16_t kAbsoluteEntry = 0x0def;
+
+  auto pe = makeMinimalPe64(kSectionRva, kSectionRawSize, kImageBase);
+  putDataDirectory64(pe,
+                     DIR_BASERELOC,
+                     kRelocDirectoryRva,
+                     sizeof(reloc_block) + (2 * sizeof(std::uint16_t)));
+  putRelocationBlock(pe,
+                     sectionOffset(kRelocDirectoryRva),
+                     kBlockPageRva,
+                     {kDir64Entry, kAbsoluteEntry});
+
+  auto p = parse(pe);
+  INFO(GetPEErrString() << " at " << GetPEErrLoc());
+  REQUIRE(p);
+
+  std::vector<RelocInfo> relocations;
+  IterRelocs(p.get(), captureRelocation, &relocations);
+
+  REQUIRE(relocations.size() == 1);
+  REQUIRE(relocations[0].addr == kImageBase + kBlockPageRva + 0x0abc);
+  REQUIRE(relocations[0].type == RELOC_DIR64);
+}
+
+TEST_CASE("relocation blocks ending exactly at directory boundary are accepted",
+          "[relocations]") {
+  constexpr std::uint32_t kImageBase = 0x10000000;
+  constexpr std::uint32_t kRelocDirectoryRva =
+      kSectionRva + kSectionRawSize - (sizeof(reloc_block) +
+                                       sizeof(std::uint16_t));
+
+  auto pe = makeMinimalPe(kSectionRva, kSectionRawSize, kImageBase);
+  putDataDirectory(pe,
+                   DIR_BASERELOC,
+                   kRelocDirectoryRva,
+                   sizeof(reloc_block) + sizeof(std::uint16_t));
+  putRelocationBlock(pe,
+                     sectionOffset(kRelocDirectoryRva),
+                     kSectionRva + 0x34,
+                     {static_cast<std::uint16_t>((RELOC_HIGHLOW << 12) |
+                                                  0x000f)});
+
+  auto p = parse(pe);
+  INFO(GetPEErrString() << " at " << GetPEErrLoc());
+  REQUIRE(p);
+
+  std::vector<RelocInfo> relocations;
+  IterRelocs(p.get(), captureRelocation, &relocations);
+
+  REQUIRE(relocations.size() == 1);
+  REQUIRE(relocations[0].addr ==
+          static_cast<VA>(kImageBase) + kSectionRva + 0x34 + 0x000f);
+}
+
+TEST_CASE("malformed relocation blocks are rejected without fake addresses",
+          "[relocations]") {
+  constexpr std::uint32_t kRelocDirectoryRva = kSectionRva + 0x1000;
+  constexpr std::size_t kRelocOffset = sectionOffset(kRelocDirectoryRva);
+  const auto makeRelocPe = [&]() {
+    return makeMinimalPe(kSectionRva, kSectionRawSize, 0x00400000);
+  };
+
+  SECTION("directory is too small for a block header") {
+    auto pe = makeRelocPe();
+    putDataDirectory(pe, DIR_BASERELOC, kRelocDirectoryRva, 7);
+
+    auto p = parse(pe);
+
+    REQUIRE_FALSE(p);
+    REQUIRE(GetPEErr() == PEERR_MAGIC);
+  }
+
+  SECTION("block size is smaller than a block header") {
+    auto pe = makeRelocPe();
+    putDataDirectory(pe, DIR_BASERELOC, kRelocDirectoryRva, 8);
+    put32(pe, kRelocOffset + offsetof(reloc_block, PageRVA), 0x2000);
+    put32(pe, kRelocOffset + offsetof(reloc_block, BlockSize), 7);
+
+    auto p = parse(pe);
+
+    REQUIRE_FALSE(p);
+    REQUIRE(GetPEErr() == PEERR_MAGIC);
+  }
+
+  SECTION("odd block payload is rejected") {
+    auto pe = makeRelocPe();
+    putDataDirectory(pe, DIR_BASERELOC, kRelocDirectoryRva, 9);
+    put32(pe, kRelocOffset + offsetof(reloc_block, PageRVA), 0x2000);
+    put32(pe, kRelocOffset + offsetof(reloc_block, BlockSize), 9);
+    pe[kRelocOffset + sizeof(reloc_block)] = 0x30;
+
+    auto p = parse(pe);
+
+    REQUIRE_FALSE(p);
+    REQUIRE(GetPEErr() == PEERR_MAGIC);
+  }
+
+  SECTION("block header extending beyond directory is rejected") {
+    auto pe = makeRelocPe();
+    putDataDirectory(pe, DIR_BASERELOC, kRelocDirectoryRva, 7);
+    put32(pe, kRelocOffset, 0x2000);
+    put32(pe, kRelocOffset + 4, 12);
+
+    auto p = parse(pe);
+
+    REQUIRE_FALSE(p);
+    REQUIRE(GetPEErr() == PEERR_MAGIC);
+  }
+
+  SECTION("entry extending beyond directory is rejected") {
+    auto pe = makeRelocPe();
+    putDataDirectory(pe, DIR_BASERELOC, kRelocDirectoryRva, 9);
+    put32(pe, kRelocOffset + offsetof(reloc_block, PageRVA), 0x2000);
+    put32(pe, kRelocOffset + offsetof(reloc_block, BlockSize), 10);
+
+    auto p = parse(pe);
+
+    REQUIRE_FALSE(p);
+    REQUIRE(GetPEErr() == PEERR_MAGIC);
+  }
+
+  SECTION("truncated block after a complete block leaves no relocations") {
+    constexpr std::uint32_t kDirectorySize =
+        (2 * sizeof(reloc_block)) + sizeof(std::uint16_t);
+    auto pe = makeRelocPe();
+    putDataDirectory(
+        pe, DIR_BASERELOC, kRelocDirectoryRva, kDirectorySize);
+    putRelocationBlock(
+        pe,
+        kRelocOffset,
+        0x2000,
+        {static_cast<std::uint16_t>((RELOC_HIGHLOW << 12) | 0x0001)});
+
+    const std::size_t truncatedBlockOffset =
+        kRelocOffset + sizeof(reloc_block) + sizeof(std::uint16_t);
+    put32(pe, truncatedBlockOffset, 0x3000);
+    put32(pe, truncatedBlockOffset + 4, 10);
+
+    auto p = parse(pe);
+
+    REQUIRE_FALSE(p);
+    REQUIRE(GetPEErr() == PEERR_MAGIC);
+  }
+}
+
+TEST_CASE("relocation address additions are checked for overflow",
+          "[relocations]") {
+  constexpr std::uint32_t kRelocDirectoryRva = kSectionRva;
+  constexpr std::size_t kRelocOffset = sectionOffset(kRelocDirectoryRva);
+
+  SECTION("32-bit page and image base overflow") {
+    constexpr std::uint32_t kImageBase = 0x10000;
+    constexpr std::uint32_t kOverflowingPageRva =
+        std::numeric_limits<std::uint32_t>::max() - kImageBase + 1;
+    constexpr std::uint32_t kRelocSectionRva = kOverflowingPageRva & 0xfffff000;
+    auto pe = makeMinimalPe(kRelocSectionRva, kSectionRawSize, kImageBase);
+    putDataDirectory(pe,
+                     DIR_BASERELOC,
+                     kRelocSectionRva,
+                     sizeof(reloc_block) + sizeof(std::uint16_t));
+    putRelocationBlock(
+        pe,
+        sectionOffset(kRelocSectionRva, kRelocSectionRva),
+        kOverflowingPageRva,
+        {static_cast<std::uint16_t>((RELOC_HIGHLOW << 12) | 0x0001)});
+
+    auto p = parse(pe);
+
+    REQUIRE_FALSE(p);
+    REQUIRE(GetPEErr() == PEERR_MAGIC);
+  }
+
+  SECTION("64-bit page and image base overflow") {
+    constexpr std::uint64_t kImageBase =
+        std::numeric_limits<std::uint64_t>::max() - 0x10;
+    constexpr std::uint32_t kOverflowingPageRva = 0x20;
+    auto pe = makeMinimalPe64(kSectionRva, kSectionRawSize, kImageBase);
+    putDataDirectory64(pe,
+                       DIR_BASERELOC,
+                       kRelocDirectoryRva,
+                       sizeof(reloc_block) + sizeof(std::uint16_t));
+    putRelocationBlock(
+        pe,
+        kRelocOffset,
+        kOverflowingPageRva,
+        {static_cast<std::uint16_t>((RELOC_DIR64 << 12) | 0x0001)});
+
+    auto p = parse(pe);
+
+    REQUIRE_FALSE(p);
+    REQUIRE(GetPEErr() == PEERR_MAGIC);
+  }
 }
 
 TEST_CASE("overflowing debug directory data range is skipped", "[debug]") {
