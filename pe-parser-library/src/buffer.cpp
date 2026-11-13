@@ -24,6 +24,7 @@ THE SOFTWARE.
 
 #include <cstring>
 #include <fstream>
+#include <limits>
 
 // keep this header above "windows.h" because it contains many types
 #include <pe-parse/parse.h>
@@ -231,12 +232,34 @@ bounded_buffer *readFileToFileBuffer(const char *filePath) {
     return nullptr;
   }
 
+  if (fileSize > std::numeric_limits<std::uint32_t>::max()) {
+    CloseHandle(h);
+    PE_ERR(PEERR_SIZE);
+    return nullptr;
+  }
+
 #else
   // only where we have mmap / open / etc
   int fd = open(filePath, O_RDONLY);
 
   if (fd == -1) {
     PE_ERR(PEERR_OPEN);
+    return nullptr;
+  }
+
+  struct stat s;
+  memset(&s, 0, sizeof(struct stat));
+  if (fstat(fd, &s) != 0) {
+    close(fd);
+    PE_ERR(PEERR_STAT);
+    return nullptr;
+  }
+
+  if (s.st_size < 0 ||
+      static_cast<std::uint64_t>(s.st_size) >
+          std::numeric_limits<std::uint32_t>::max()) {
+    close(fd);
+    PE_ERR(PEERR_SIZE);
     return nullptr;
   }
 #endif
@@ -284,17 +307,6 @@ bounded_buffer *readFileToFileBuffer(const char *filePath) {
   p->bufLen = fileSize;
 #else
   p->detail->fd = fd;
-
-  struct stat s;
-  memset(&s, 0, sizeof(struct stat));
-
-  if (fstat(fd, &s) != 0) {
-    close(fd);
-    delete d;
-    delete p;
-    PE_ERR(PEERR_STAT);
-    return nullptr;
-  }
 
   void *maddr = mmap(nullptr,
                      static_cast<std::size_t>(s.st_size),

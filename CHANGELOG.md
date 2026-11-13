@@ -9,6 +9,14 @@ All versions prior to [2.0.0] are untracked.
 
 ## [Unreleased]
 
+### Fixed
+
+- Reject malformed PE section, symbol, resource, import, export, relocation,
+  and debug table counts or ranges before allocating or iterating over
+  attacker-controlled entries. Table sizes are checked against the actual
+  file and section bounds with overflow-safe address arithmetic. File-backed
+  buffers now reject files larger than the parser's 32-bit address space.
+
 ## [3.0.0-rc.1] - 2026-05-22
 
 ### Added

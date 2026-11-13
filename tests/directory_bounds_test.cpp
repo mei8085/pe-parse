@@ -31,6 +31,15 @@ struct ExportInfo {
   std::string forwardName;
 };
 
+struct SymbolInfo {
+  std::string name;
+  std::uint32_t value;
+  std::int16_t sectionNumber;
+  std::uint16_t type;
+  std::uint8_t storageClass;
+  std::uint8_t numberOfAuxSymbols;
+};
+
 template <typename T>
 void put16(T &buffer, std::size_t offset, std::uint16_t value) {
   buffer[offset] = static_cast<std::uint8_t>(value);
@@ -107,6 +116,28 @@ void putSectionRawRange(TestPe &pe,
         rawOffset);
 }
 
+void putFileHeaderWord(TestPe &pe,
+                       std::size_t fieldOffset,
+                       std::uint16_t value) {
+  put16(pe,
+        kNtHeaderOffset + offsetof(nt_header_32, FileHeader) + fieldOffset,
+        value);
+}
+
+void putFileHeaderDword(TestPe &pe,
+                        std::size_t fieldOffset,
+                        std::uint32_t value) {
+  put32(pe,
+        kNtHeaderOffset + offsetof(nt_header_32, FileHeader) + fieldOffset,
+        value);
+}
+
+void putOptionalHeaderDword(TestPe &pe,
+                            std::size_t fieldOffset,
+                            std::uint32_t value) {
+  put32(pe, optionalHeaderOffset() + fieldOffset, value);
+}
+
 void putDebugEntry(TestPe &pe,
                    std::uint32_t sizeOfData,
                    std::uint32_t addressOfRawData) {
@@ -162,6 +193,9 @@ TestPe makeMinimalPe(std::uint32_t sectionRva = kSectionRva,
         kFileHeaderOffset + offsetof(file_header, Machine),
         IMAGE_FILE_MACHINE_I386);
   put16(pe, kFileHeaderOffset + offsetof(file_header, NumberOfSections), 1);
+  put16(pe,
+        kFileHeaderOffset + offsetof(file_header, SizeOfOptionalHeader),
+        sizeof(optional_header_32));
 
   put16(pe,
         optionalHeaderOffset() + offsetof(optional_header_32, Magic),
@@ -213,6 +247,19 @@ int captureExport(void *ctx,
                   const std::string &forwardName) {
   auto *exports = static_cast<std::vector<ExportInfo> *>(ctx);
   exports->push_back({addr, ordinal, symbolName, forwardName});
+  return 0;
+}
+
+int captureSymbol(void *ctx,
+                  const std::string &name,
+                  const std::uint32_t &value,
+                  const std::int16_t &sectionNumber,
+                  const std::uint16_t &type,
+                  const std::uint8_t &storageClass,
+                  const std::uint8_t &numberOfAuxSymbols) {
+  auto *symbols = static_cast<std::vector<SymbolInfo> *>(ctx);
+  symbols->push_back(
+      {name, value, sectionNumber, type, storageClass, numberOfAuxSymbols});
   return 0;
 }
 
@@ -271,6 +318,171 @@ TEST_CASE("oversized section raw data range is rejected", "[sections]") {
   REQUIRE(GetPEErr() == PEERR_SECT);
 }
 
+TEST_CASE("truncated section table is rejected before section allocation",
+          "[sections]") {
+  auto pe = makeMinimalPe();
+  putFileHeaderWord(pe,
+                    offsetof(file_header, NumberOfSections),
+                    119);
+
+  auto p = parse(pe);
+
+  REQUIRE_FALSE(p);
+  REQUIRE(GetPEErr() == PEERR_SECT);
+}
+
+TEST_CASE("more data directories than the PE format allows are rejected",
+          "[data_directory]") {
+  auto pe = makeMinimalPe();
+  putOptionalHeaderDword(
+      pe, offsetof(optional_header_32, NumberOfRvaAndSizes),
+      NUM_DIR_ENTRIES + 1);
+
+  auto p = parse(pe);
+
+  REQUIRE_FALSE(p);
+  REQUIRE(GetPEErr() == PEERR_HDR);
+}
+
+TEST_CASE("symbol table length overflow is rejected before symbol iteration",
+          "[symbols]") {
+  auto pe = makeMinimalPe();
+  putFileHeaderDword(pe,
+                     offsetof(file_header, PointerToSymbolTable),
+                     kSectionRawOffset);
+  putFileHeaderDword(pe,
+                     offsetof(file_header, NumberOfSymbols),
+                     std::numeric_limits<std::uint32_t>::max() /
+                             SYMTAB_RECORD_LEN +
+                         1);
+
+  auto p = parse(pe);
+
+  REQUIRE_FALSE(p);
+  REQUIRE(GetPEErr() == PEERR_HDR);
+}
+
+TEST_CASE("truncated symbol table is rejected before symbol entries are kept",
+          "[symbols]") {
+  auto pe = makeMinimalPe();
+  putFileHeaderDword(pe,
+                     offsetof(file_header, PointerToSymbolTable),
+                     static_cast<std::uint32_t>(kFileSize) - 1);
+  putFileHeaderDword(pe, offsetof(file_header, NumberOfSymbols), 1);
+
+  auto p = parse(pe);
+
+  REQUIRE_FALSE(p);
+  REQUIRE(GetPEErr() == PEERR_HDR);
+}
+
+TEST_CASE("symbol count without a symbol table is rejected", "[symbols]") {
+  auto pe = makeMinimalPe();
+  putFileHeaderDword(pe, offsetof(file_header, PointerToSymbolTable), 0);
+  putFileHeaderDword(pe, offsetof(file_header, NumberOfSymbols), 1);
+
+  auto p = parse(pe);
+
+  REQUIRE_FALSE(p);
+  REQUIRE(GetPEErr() == PEERR_HDR);
+}
+
+TEST_CASE("symbol entries are read lazily without retaining a symbol vector",
+          "[symbols]") {
+  auto pe = makeMinimalPe();
+  constexpr std::uint32_t kSymbolOffset = kSectionRawOffset + 0x100;
+  putFileHeaderDword(
+      pe, offsetof(file_header, PointerToSymbolTable), kSymbolOffset);
+  putFileHeaderDword(pe, offsetof(file_header, NumberOfSymbols), 1);
+  putCString(pe, kSymbolOffset, "symbol");
+  put32(pe, kSymbolOffset + 8, 0x4321);
+  put16(pe, kSymbolOffset + 10, 1);
+  put16(pe, kSymbolOffset + 12, 0x20);
+  pe[kSymbolOffset + 14] = IMAGE_SYM_CLASS_EXTERNAL;
+  pe[kSymbolOffset + 15] = 0;
+
+  auto p = parse(pe);
+
+  REQUIRE(p);
+  std::vector<SymbolInfo> symbols;
+  IterSymbols(p.get(), captureSymbol, &symbols);
+  REQUIRE(symbols.size() == 1);
+  REQUIRE(symbols[0].name == "symbol");
+  REQUIRE(symbols[0].value == 0x14321);
+  REQUIRE(symbols[0].sectionNumber == 1);
+  REQUIRE(symbols[0].type == 0x20);
+  REQUIRE(symbols[0].storageClass == IMAGE_SYM_CLASS_EXTERNAL);
+}
+
+TEST_CASE("debug directory lengths must be whole debug entries", "[debug]") {
+  auto pe = makeMinimalPe();
+  putDataDirectory(
+      pe, DIR_DEBUG, kDebugDirectoryRva, sizeof(debug_dir_entry) + 1);
+
+  auto p = parse(pe);
+
+  REQUIRE_FALSE(p);
+}
+
+TEST_CASE("a debug directory address without a length is rejected",
+          "[debug]") {
+  auto pe = makeMinimalPe();
+  putDataDirectory(pe, DIR_DEBUG, kDebugDirectoryRva, 0);
+
+  auto p = parse(pe);
+
+  REQUIRE_FALSE(p);
+}
+
+TEST_CASE("cyclic resource directories are rejected", "[resources]") {
+  auto pe = makeMinimalPe();
+  constexpr auto kSectionNameOffset = sectionHeaderOffset();
+  for (std::size_t i = 0; i < NT_SHORT_NAME_LEN; ++i) {
+    pe[kSectionNameOffset + i] = i < 5 ? ".rsrc"[i] : 0;
+  }
+
+  constexpr auto kResourceOffset = kSectionRawOffset;
+  put16(pe,
+        kResourceOffset + offsetof(resource_dir_table, NameEntries),
+        1);
+  put32(pe, kResourceOffset + sizeof(resource_dir_table), 1);
+  put32(pe,
+        kResourceOffset + sizeof(resource_dir_table) +
+            offsetof(resource_dir_entry_sz, RVA),
+        0x80000000);
+
+  auto p = parse(pe);
+
+  REQUIRE_FALSE(p);
+  REQUIRE(GetPEErr() == PEERR_RESC);
+}
+
+TEST_CASE("relocation blocks cannot extend past their data directory",
+          "[relocations]") {
+  auto pe = makeMinimalPe();
+  constexpr auto kRelocOffset = kSectionRawOffset;
+  putDataDirectory(pe, DIR_BASERELOC, kSectionRva, sizeof(reloc_block));
+  put32(pe, kRelocOffset + offsetof(reloc_block, PageRVA), kSectionRva);
+  put32(pe,
+        kRelocOffset + offsetof(reloc_block, BlockSize),
+        sizeof(reloc_block) + sizeof(std::uint16_t));
+
+  auto p = parse(pe);
+
+  REQUIRE_FALSE(p);
+}
+
+TEST_CASE("import directory lengths must be whole import entries",
+          "[imports]") {
+  auto pe = makeMinimalPe();
+  putDataDirectory(
+      pe, DIR_IMPORT, kSectionRva, sizeof(import_dir_entry) + 1);
+
+  auto p = parse(pe);
+
+  REQUIRE_FALSE(p);
+}
+
 TEST_CASE("debug directory data can end at section boundary", "[debug]") {
   auto pe = makeMinimalPe();
   putDataDirectory(pe, DIR_DEBUG, kDebugDirectoryRva, sizeof(debug_dir_entry));
@@ -285,32 +497,24 @@ TEST_CASE("debug directory data can end at section boundary", "[debug]") {
   REQUIRE(sizes == std::vector<std::uint32_t>{4});
 }
 
-TEST_CASE("oversized debug directory data range is skipped", "[debug]") {
+TEST_CASE("oversized debug directory data range is rejected", "[debug]") {
   auto pe = makeMinimalPe();
   putDataDirectory(pe, DIR_DEBUG, kDebugDirectoryRva, sizeof(debug_dir_entry));
   putDebugEntry(pe, 5, sectionEndRva() - 4);
 
   auto p = parse(pe);
   INFO(GetPEErrString() << " at " << GetPEErrLoc());
-  REQUIRE(p);
-
-  std::size_t debugDirectoryCount = 0;
-  IterDebugs(p.get(), countDebugDirectory, &debugDirectoryCount);
-  REQUIRE(debugDirectoryCount == 0);
+  REQUIRE_FALSE(p);
 }
 
-TEST_CASE("overflowing debug directory data range is skipped", "[debug]") {
+TEST_CASE("overflowing debug directory data range is rejected", "[debug]") {
   auto pe = makeMinimalPe();
   putDataDirectory(pe, DIR_DEBUG, kDebugDirectoryRva, sizeof(debug_dir_entry));
   putDebugEntry(pe, std::numeric_limits<std::uint32_t>::max(), kDebugDataRva);
 
   auto p = parse(pe);
   INFO(GetPEErrString() << " at " << GetPEErrLoc());
-  REQUIRE(p);
-
-  std::size_t debugDirectoryCount = 0;
-  IterDebugs(p.get(), countDebugDirectory, &debugDirectoryCount);
-  REQUIRE(debugDirectoryCount == 0);
+  REQUIRE_FALSE(p);
 }
 
 TEST_CASE("data directory entry can end at section boundary",
@@ -341,7 +545,7 @@ TEST_CASE("oversized data directory entry is rejected", "[data_directory]") {
   REQUIRE(rawEntry.empty());
 }
 
-TEST_CASE("overflowing export directory range can contain forwarded exports",
+TEST_CASE("overflowing export directory range is rejected",
           "[exports]") {
   constexpr std::uint32_t kExportSectionRva = 0xffffff00;
   constexpr std::uint32_t kExportDirectorySize = 0x200;
@@ -408,14 +612,7 @@ TEST_CASE("overflowing export directory range can contain forwarded exports",
 
   auto p = parse(pe);
   INFO(GetPEErrString() << " at " << GetPEErrLoc());
-  REQUIRE(p);
-
-  std::vector<ExportInfo> exports;
-  IterExpFull(p.get(), captureExport, &exports);
-
-  REQUIRE(exports.size() == 1);
-  REQUIRE(exports[0].addr == 0);
-  REQUIRE(exports[0].forwardName == "target.dll.Func");
+  REQUIRE_FALSE(p);
 }
 
 TEST_CASE("ordinal-only exports are included", "[exports]") {

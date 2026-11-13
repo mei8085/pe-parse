@@ -28,6 +28,7 @@ THE SOFTWARE.
 #include <cstring>
 #include <iostream>
 #include <limits>
+#include <set>
 #include <stdexcept>
 #include <vector>
 
@@ -83,58 +84,10 @@ struct debugent {
 };
 
 #define SYMBOL_NAME_OFFSET(sn) (static_cast<std::uint32_t>(sn.data >> 32))
-#define SYMBOL_TYPE_HI(x) (x.type >> 8)
-
 union symbol_name {
   std::uint8_t shortName[NT_SHORT_NAME_LEN];
   std::uint32_t zeroes;
   std::uint64_t data;
-};
-
-struct aux_symbol_f1 {
-  std::uint32_t tagIndex;
-  std::uint32_t totalSize;
-  std::uint32_t pointerToLineNumber;
-  std::uint32_t pointerToNextFunction;
-};
-
-struct aux_symbol_f2 {
-  std::uint16_t lineNumber;
-  std::uint32_t pointerToNextFunction;
-};
-
-struct aux_symbol_f3 {
-  std::uint32_t tagIndex;
-  std::uint32_t characteristics;
-};
-
-struct aux_symbol_f4 {
-  std::uint8_t filename[SYMTAB_RECORD_LEN];
-  std::string strFilename;
-};
-
-struct aux_symbol_f5 {
-  std::uint32_t length;
-  std::uint16_t numberOfRelocations;
-  std::uint16_t numberOfLineNumbers;
-  std::uint32_t checkSum;
-  std::uint16_t number;
-  std::uint8_t selection;
-};
-
-struct symbol {
-  std::string strName;
-  symbol_name name;
-  std::uint32_t value;
-  std::int16_t sectionNumber;
-  std::uint16_t type;
-  std::uint8_t storageClass;
-  std::uint8_t numberOfAuxSymbols;
-  std::vector<aux_symbol_f1> aux_symbols_f1;
-  std::vector<aux_symbol_f2> aux_symbols_f2;
-  std::vector<aux_symbol_f3> aux_symbols_f3;
-  std::vector<aux_symbol_f4> aux_symbols_f4;
-  std::vector<aux_symbol_f5> aux_symbols_f5;
 };
 
 struct parsed_pe_internal {
@@ -143,7 +96,6 @@ struct parsed_pe_internal {
   std::vector<importent> imports;
   std::vector<reloc> relocs;
   std::vector<exportent> exports;
-  std::vector<symbol> symbols;
   std::vector<debugent> debugdirs;
 };
 
@@ -606,17 +558,81 @@ static bool readCString(const bounded_buffer &buffer,
   return false;
 }
 
+static bool checkedAddU32(std::uint32_t lhs,
+                          std::uint64_t rhs,
+                          std::uint32_t &result) {
+  if (rhs > static_cast<std::uint64_t>(
+                std::numeric_limits<std::uint32_t>::max() - lhs)) {
+    return false;
+  }
+
+  result = lhs + static_cast<std::uint32_t>(rhs);
+  return true;
+}
+
+static bool checkedAddU64(std::uint64_t lhs,
+                          std::uint64_t rhs,
+                          std::uint64_t &result) {
+  if (rhs > std::numeric_limits<std::uint64_t>::max() - lhs) {
+    return false;
+  }
+
+  result = lhs + rhs;
+  return true;
+}
+
+static bool checkedTableRange(std::uint64_t offset,
+                              std::uint64_t count,
+                              std::uint64_t elementSize,
+                              std::uint64_t limit,
+                              std::uint64_t &end) {
+  if (elementSize == 0 || offset > limit ||
+      count > (std::numeric_limits<std::uint64_t>::max() - offset) /
+                  elementSize) {
+    return false;
+  }
+
+  const std::uint64_t bytes = count * elementSize;
+  if (!checkedAddU64(offset, bytes, end) || end > limit) {
+    return false;
+  }
+
+  return true;
+}
+
+static bool checkedTableRange(const bounded_buffer &buffer,
+                              std::uint32_t offset,
+                              std::uint64_t count,
+                              std::uint64_t elementSize) {
+  std::uint64_t end;
+  return checkedTableRange(
+      offset, count, elementSize, buffer.bufLen, end);
+}
+
+static bool checkedRvaToVA(VA imageBase,
+                           std::uint32_t rva,
+                           VA &va) {
+  return checkedAddU64(imageBase, static_cast<VA>(rva), va);
+}
+
+static bool rvaRangeInDataDirectory(std::uint32_t rva,
+                                    std::uint64_t bytes,
+                                    const data_directory &dir);
+
 static bool rvaInDataDirectory(std::uint32_t rva, const data_directory &dir) {
-  return rva >= dir.VirtualAddress && rva - dir.VirtualAddress < dir.Size;
+  return rvaRangeInDataDirectory(rva, 1, dir);
 }
 
 bool getSecForVA(const std::vector<section> &secs, VA v, section &sec) {
-  for (section s : secs) {
-    std::uint64_t low = s.sectionBase;
-    std::uint64_t high = low + s.sec.Misc.VirtualSize;
+  for (const section &candidate : secs) {
+    std::uint64_t low = candidate.sectionBase;
+    std::uint64_t high;
+    if (!checkedAddU64(low, candidate.sec.Misc.VirtualSize, high)) {
+      continue;
+    }
 
     if (v >= low && v < high) {
-      sec = s;
+      sec = candidate;
       return true;
     }
   }
@@ -624,16 +640,15 @@ bool getSecForVA(const std::vector<section> &secs, VA v, section &sec) {
   return false;
 }
 
-static VA rvaToVA(VA imageBase, std::uint32_t rva) {
-  return static_cast<VA>(rva) + imageBase;
-}
-
 static bool getSectionForRVA(const std::vector<section> &secs,
                              VA imageBase,
                              std::uint32_t rva,
                              section &sec,
                              std::uint32_t &off) {
-  VA va = rvaToVA(imageBase, rva);
+  VA va;
+  if (!checkedRvaToVA(imageBase, rva, va)) {
+    return false;
+  }
   if (!getSecForVA(secs, va, sec)) {
     return false;
   }
@@ -655,6 +670,51 @@ static bool readRvaCString(const std::vector<section> &secs,
   return readCString(*stringSec.sectionData, stringOff, result);
 }
 
+static bool getSectionForRvaRange(const std::vector<section> &secs,
+                                  VA imageBase,
+                                  std::uint32_t rva,
+                                  std::uint64_t bytes,
+                                  section &sec,
+                                  std::uint32_t &off) {
+  if (bytes == 0 ||
+      !getSectionForRVA(secs, imageBase, rva, sec, off)) {
+    return false;
+  }
+
+  return checkedTableRange(*sec.sectionData, off, 1, bytes);
+}
+
+static bool rvaRangeInDataDirectory(std::uint32_t rva,
+                                    std::uint64_t bytes,
+                                    const data_directory &dir) {
+  if (bytes == 0) {
+    return false;
+  }
+
+  const std::uint64_t end =
+      static_cast<std::uint64_t>(rva) + static_cast<std::uint64_t>(bytes);
+  const std::uint64_t directoryEnd =
+      static_cast<std::uint64_t>(dir.VirtualAddress) + dir.Size;
+  return directoryEnd <=
+             static_cast<std::uint64_t>(
+                 std::numeric_limits<std::uint32_t>::max()) + 1 &&
+         rva >= dir.VirtualAddress && end <= directoryEnd;
+}
+
+static bool imageBaseForNtHeader(const nt_header_32 &header, VA &imageBase) {
+  if (header.OptionalMagic == NT_OPTIONAL_32_MAGIC) {
+    imageBase = header.OptionalHeader.ImageBase;
+    return true;
+  }
+
+  if (header.OptionalMagic == NT_OPTIONAL_64_MAGIC) {
+    imageBase = header.OptionalHeader64.ImageBase;
+    return true;
+  }
+
+  return false;
+}
+
 static bool checkedTableOffset(std::uint32_t base,
                                std::uint32_t index,
                                std::uint32_t width,
@@ -671,10 +731,6 @@ static bool checkedTableOffset(std::uint32_t base,
 static bool readExportRVA(const export_table_context &exports,
                           std::uint32_t eatIndex,
                           std::uint32_t &symRVA) {
-  if (eatIndex > std::numeric_limits<std::uint16_t>::max()) {
-    return false;
-  }
-
   std::uint32_t eatEntryOff;
   if (!checkedTableOffset(
           exports.eatOff, eatIndex, sizeof(std::uint32_t), eatEntryOff)) {
@@ -692,12 +748,18 @@ static bool exportRvaToEntry(const export_table_context &exports,
                              std::uint32_t eatIndex,
                              std::uint32_t symRVA,
                              exportent &entry) {
+  if (eatIndex > std::numeric_limits<std::uint16_t>::max()) {
+    return false;
+  }
+
   entry.ordinal = static_cast<std::uint16_t>(eatIndex);
   entry.symbolName.clear();
   entry.moduleName = exports.moduleName;
 
   if (!rvaInDataDirectory(symRVA, exports.exportDir)) {
-    entry.addr = rvaToVA(exports.imageBase, symRVA);
+    if (!checkedRvaToVA(exports.imageBase, symRVA, entry.addr)) {
+      return false;
+    }
     entry.forwardName.clear();
     return true;
   }
@@ -770,7 +832,8 @@ bool parse_resource_table(bounded_buffer *sectionData,
                           std::uint32_t virtaddr,
                           std::uint32_t depth,
                           resource_dir_entry *dirent,
-                          std::vector<resource> &rsrcs) {
+                          std::vector<resource> &rsrcs,
+                          std::set<std::uint32_t> &visitedOffsets) {
   resource_dir_table rdt;
 
   if (sectionData == nullptr) {
@@ -784,21 +847,52 @@ bool parse_resource_table(bounded_buffer *sectionData,
   READ_WORD(sectionData, o, rdt, NameEntries);
   READ_WORD(sectionData, o, rdt, IDEntries);
 
-  o += sizeof(resource_dir_table);
+  const std::uint32_t entryCount =
+      static_cast<std::uint32_t>(rdt.NameEntries) + rdt.IDEntries;
+  std::uint32_t entryTableOffset;
+  if (entryCount < rdt.NameEntries ||
+      !checkedAddU32(o, sizeof(resource_dir_table), entryTableOffset) ||
+      !checkedTableRange(
+          *sectionData, entryTableOffset, entryCount,
+          sizeof(resource_dir_entry_sz))) {
+    PE_ERR(PEERR_RESC);
+    return false;
+  }
 
-  if (rdt.NameEntries == 0u && rdt.IDEntries == 0u) {
+  if (visitedOffsets.find(o) != visitedOffsets.end()) {
+    PE_ERR(PEERR_RESC);
+    return false;
+  }
+  visitedOffsets.insert(o);
+
+  std::uint32_t entryOffset = entryTableOffset;
+
+  if (entryCount == 0u) {
     return true; // This is not a hard error. It does happen.
   }
 
-  for (std::uint32_t i = 0;
-       i < static_cast<std::uint32_t>(rdt.NameEntries + rdt.IDEntries);
-       i++) {
+  for (std::uint32_t i = 0; i < entryCount; i++) {
     resource_dir_entry *rde = dirent;
     if (dirent == nullptr) {
       rde = new resource_dir_entry;
     }
 
-    if (!readDword(sectionData, o + offsetof(__typeof__(*rde), ID), rde->ID)) {
+    std::uint32_t idOffset;
+    std::uint32_t rvaOffset;
+    if (!checkedAddU32(
+            entryOffset, offsetof(__typeof__(*rde), ID), idOffset) ||
+        !checkedAddU32(
+            entryOffset, offsetof(__typeof__(*rde), RVA), rvaOffset)) {
+      PE_ERR(PEERR_RESC);
+      if (dirent == nullptr) {
+        delete rde;
+      }
+      return false;
+    }
+
+    if (!readDword(
+            sectionData, idOffset,
+            rde->ID)) {
       PE_ERR(PEERR_READ);
       if (dirent == nullptr) {
         delete rde;
@@ -807,7 +901,8 @@ bool parse_resource_table(bounded_buffer *sectionData,
     }
 
     if (!readDword(
-            sectionData, o + offsetof(__typeof__(*rde), RVA), rde->RVA)) {
+            sectionData, rvaOffset,
+            rde->RVA)) {
       PE_ERR(PEERR_READ);
       if (dirent == nullptr) {
         delete rde;
@@ -815,7 +910,15 @@ bool parse_resource_table(bounded_buffer *sectionData,
       return false;
     }
 
-    o += sizeof(resource_dir_entry_sz);
+    if (!checkedAddU32(entryOffset,
+                       sizeof(resource_dir_entry_sz),
+                       entryOffset)) {
+      PE_ERR(PEERR_RESC);
+      if (dirent == nullptr) {
+        delete rde;
+      }
+      return false;
+    }
 
     if (depth == 0) {
       rde->type = rde->ID;
@@ -864,12 +967,24 @@ bool parse_resource_table(bounded_buffer *sectionData,
     // High bit 0 = RVA to RDT.
     // High bit 1 = RVA to RDE.
     if (rde->RVA & 0x80000000) {
+      const std::uint32_t childOffset = rde->RVA & 0x0FFFFFFF;
+      if (!checkedTableRange(*sectionData,
+                             childOffset,
+                             1,
+                             sizeof(resource_dir_table))) {
+        PE_ERR(PEERR_RESC);
+        if (dirent == nullptr) {
+          delete rde;
+        }
+        return false;
+      }
       if (!parse_resource_table(sectionData,
-                                rde->RVA & 0x0FFFFFFF,
+                                childOffset,
                                 virtaddr,
                                 depth + 1,
                                 rde,
-                                rsrcs)) {
+                                rsrcs,
+                                visitedOffsets)) {
         if (dirent == nullptr) {
           delete rde;
         }
@@ -877,6 +992,38 @@ bool parse_resource_table(bounded_buffer *sectionData,
       }
     } else {
       resource_dat_entry rdat;
+
+      std::uint32_t dataRvaOffset;
+      std::uint32_t dataSizeOffset;
+      std::uint32_t codepageOffset;
+      std::uint32_t reservedOffset;
+      if (!checkedAddU32(rde->RVA,
+                         offsetof(__typeof__(rdat), RVA),
+                         dataRvaOffset) ||
+          !checkedAddU32(rde->RVA,
+                         offsetof(__typeof__(rdat), size),
+                         dataSizeOffset) ||
+          !checkedAddU32(rde->RVA,
+                         offsetof(__typeof__(rdat), codepage),
+                         codepageOffset) ||
+          !checkedAddU32(rde->RVA,
+                         offsetof(__typeof__(rdat), reserved),
+                         reservedOffset)) {
+        PE_ERR(PEERR_RESC);
+        if (dirent == nullptr) {
+          delete rde;
+        }
+        return false;
+      }
+
+      if (!checkedTableRange(
+              *sectionData, rde->RVA, 1, sizeof(resource_dat_entry))) {
+        PE_ERR(PEERR_RESC);
+        if (dirent == nullptr) {
+          delete rde;
+        }
+        return false;
+      }
 
       /*
        * This one is using rde->RVA as an offset.
@@ -888,7 +1035,7 @@ bool parse_resource_table(bounded_buffer *sectionData,
        */
 
       if (!readDword(sectionData,
-                     rde->RVA + offsetof(__typeof__(rdat), RVA),
+                     dataRvaOffset,
                      rdat.RVA)) {
         PE_ERR(PEERR_READ);
         if (dirent == nullptr) {
@@ -898,7 +1045,7 @@ bool parse_resource_table(bounded_buffer *sectionData,
       }
 
       if (!readDword(sectionData,
-                     rde->RVA + offsetof(__typeof__(rdat), size),
+                     dataSizeOffset,
                      rdat.size)) {
         PE_ERR(PEERR_READ);
         if (dirent == nullptr) {
@@ -908,7 +1055,7 @@ bool parse_resource_table(bounded_buffer *sectionData,
       }
 
       if (!readDword(sectionData,
-                     rde->RVA + offsetof(__typeof__(rdat), codepage),
+                     codepageOffset,
                      rdat.codepage)) {
         PE_ERR(PEERR_READ);
         if (dirent == nullptr) {
@@ -918,7 +1065,7 @@ bool parse_resource_table(bounded_buffer *sectionData,
       }
 
       if (!readDword(sectionData,
-                     rde->RVA + offsetof(__typeof__(rdat), reserved),
+                     reservedOffset,
                      rdat.reserved)) {
         PE_ERR(PEERR_READ);
         if (dirent == nullptr) {
@@ -939,6 +1086,16 @@ bool parse_resource_table(bounded_buffer *sectionData,
       rsrc.size = rdat.size;
 
       // The start address is (RVA - section virtual address).
+      if (rdat.RVA < virtaddr ||
+          !checkedTableRange(
+              *sectionData, rdat.RVA - virtaddr, 1, rdat.size)) {
+        PE_ERR(PEERR_RESC);
+        if (dirent == nullptr) {
+          delete rde;
+        }
+        return false;
+      }
+
       uint32_t start = rdat.RVA - virtaddr;
       /*
        * Some binaries (particularly packed) will have invalid addresses here.
@@ -946,14 +1103,7 @@ bool parse_resource_table(bounded_buffer *sectionData,
        * If the start is valid, try to get the data and if that fails return
        * a zero length buffer.
        */
-      if (start > rdat.RVA) {
-        rsrc.buf = splitBuffer(sectionData, 0, 0);
-      } else {
-        rsrc.buf = splitBuffer(sectionData, start, start + rdat.size);
-        if (rsrc.buf == nullptr) {
-          rsrc.buf = splitBuffer(sectionData, 0, 0);
-        }
-      }
+      rsrc.buf = splitBufferByLength(sectionData, start, rdat.size);
 
       /* If we can't get even a zero length buffer, something is very wrong. */
       if (rsrc.buf == nullptr) {
@@ -984,20 +1134,26 @@ bool parse_resource_table(bounded_buffer *sectionData,
 
 bool getResources(bounded_buffer *b,
                   bounded_buffer *fileBegin,
-                  const std::vector<section> secs,
+                  const std::vector<section> &secs,
                   std::vector<resource> &rsrcs) {
   static_cast<void>(fileBegin);
 
   if (b == nullptr)
     return false;
 
-  for (section s : secs) {
+  for (const section &s : secs) {
     if (s.sectionName != ".rsrc") {
       continue;
     }
 
-    if (!parse_resource_table(
-            s.sectionData, 0, s.sec.VirtualAddress, 0, nullptr, rsrcs)) {
+    std::set<std::uint32_t> visitedOffsets;
+    if (!parse_resource_table(s.sectionData,
+                              0,
+                              s.sec.VirtualAddress,
+                              0,
+                              nullptr,
+                              rsrcs,
+                              visitedOffsets)) {
       return false;
     }
 
@@ -1015,11 +1171,24 @@ bool getSections(bounded_buffer *b,
     return false;
   }
 
+  if (!checkedTableRange(
+          *b, 0, nthdr.FileHeader.NumberOfSections,
+          sizeof(image_section_header))) {
+    PE_ERR(PEERR_HDR);
+    return false;
+  }
+
+  secs.reserve(nthdr.FileHeader.NumberOfSections);
+
   // get each of the sections...
   for (std::uint32_t i = 0; i < nthdr.FileHeader.NumberOfSections; i++) {
     image_section_header curSec;
 
-    std::uint32_t o = i * sizeof(image_section_header);
+    std::uint32_t o;
+    if (!checkedTableOffset(0, i, sizeof(image_section_header), o)) {
+      PE_ERR(PEERR_HDR);
+      return false;
+    }
     for (std::uint32_t k = 0; k < NT_SHORT_NAME_LEN; k++) {
       if (!readByte(b, o + k, curSec.Name[k])) {
         return false;
@@ -1050,13 +1219,22 @@ bool getSections(bounded_buffer *b,
     }
 
     if (nthdr.OptionalMagic == NT_OPTIONAL_32_MAGIC) {
-      thisSec.sectionBase =
-          nthdr.OptionalHeader.ImageBase + curSec.VirtualAddress;
+      if (!checkedRvaToVA(nthdr.OptionalHeader.ImageBase,
+                          curSec.VirtualAddress,
+                          thisSec.sectionBase)) {
+        PE_ERR(PEERR_SECTVA);
+        return false;
+      }
     } else if (nthdr.OptionalMagic == NT_OPTIONAL_64_MAGIC) {
-      thisSec.sectionBase =
-          nthdr.OptionalHeader64.ImageBase + curSec.VirtualAddress;
+      if (!checkedRvaToVA(nthdr.OptionalHeader64.ImageBase,
+                          curSec.VirtualAddress,
+                          thisSec.sectionBase)) {
+        PE_ERR(PEERR_SECTVA);
+        return false;
+      }
     } else {
       PE_ERR(PEERR_MAGIC);
+      return false;
     }
 
     thisSec.sec = curSec;
@@ -1082,7 +1260,10 @@ bool getSections(bounded_buffer *b,
   return true;
 }
 
-bool readOptionalHeader(bounded_buffer *b, optional_header_32 &header) {
+bool readOptionalHeader(bounded_buffer *b,
+                        optional_header_32 &header,
+                        std::uint16_t optionalHeaderSize) {
+  header = optional_header_32{};
   READ_WORD(b, 0, header, Magic);
 
   READ_BYTE(b, 0, header, MajorLinkerVersion);
@@ -1115,21 +1296,44 @@ bool readOptionalHeader(bounded_buffer *b, optional_header_32 &header) {
   READ_DWORD(b, 0, header, LoaderFlags);
   READ_DWORD(b, 0, header, NumberOfRvaAndSizes);
 
-  if (header.NumberOfRvaAndSizes > NUM_DIR_ENTRIES) {
-    header.NumberOfRvaAndSizes = NUM_DIR_ENTRIES;
+  const std::uint32_t requiredSize =
+      offsetof(optional_header_32, DataDirectory) +
+      (static_cast<std::uint32_t>(header.NumberOfRvaAndSizes) *
+       sizeof(data_directory));
+  if (header.NumberOfRvaAndSizes > NUM_DIR_ENTRIES ||
+      requiredSize > optionalHeaderSize ||
+      !checkedTableRange(*b,
+                         offsetof(optional_header_32, DataDirectory),
+                         header.NumberOfRvaAndSizes,
+                         sizeof(data_directory))) {
+    PE_ERR(PEERR_HDR);
+    return false;
   }
 
   for (std::uint32_t i = 0; i < header.NumberOfRvaAndSizes; i++) {
-    std::uint32_t c = (i * sizeof(data_directory));
-    c += offsetof(optional_header_32, DataDirectory[0]);
+    std::uint32_t c;
+    if (!checkedTableOffset(offsetof(optional_header_32, DataDirectory[0]),
+                            i,
+                            sizeof(data_directory),
+                            c)) {
+      PE_ERR(PEERR_HDR);
+      return false;
+    }
     std::uint32_t o;
 
-    o = c + offsetof(data_directory, VirtualAddress);
+    if (!checkedAddU32(
+            c, offsetof(data_directory, VirtualAddress), o)) {
+      PE_ERR(PEERR_HDR);
+      return false;
+    }
     if (!readDword(b, o, header.DataDirectory[i].VirtualAddress)) {
       return false;
     }
 
-    o = c + offsetof(data_directory, Size);
+    if (!checkedAddU32(c, offsetof(data_directory, Size), o)) {
+      PE_ERR(PEERR_HDR);
+      return false;
+    }
     if (!readDword(b, o, header.DataDirectory[i].Size)) {
       return false;
     }
@@ -1138,7 +1342,10 @@ bool readOptionalHeader(bounded_buffer *b, optional_header_32 &header) {
   return true;
 }
 
-bool readOptionalHeader64(bounded_buffer *b, optional_header_64 &header) {
+bool readOptionalHeader64(bounded_buffer *b,
+                          optional_header_64 &header,
+                          std::uint16_t optionalHeaderSize) {
+  header = optional_header_64{};
   READ_WORD(b, 0, header, Magic);
 
   READ_BYTE(b, 0, header, MajorLinkerVersion);
@@ -1170,21 +1377,43 @@ bool readOptionalHeader64(bounded_buffer *b, optional_header_64 &header) {
   READ_DWORD(b, 0, header, LoaderFlags);
   READ_DWORD(b, 0, header, NumberOfRvaAndSizes);
 
-  if (header.NumberOfRvaAndSizes > NUM_DIR_ENTRIES) {
-    header.NumberOfRvaAndSizes = NUM_DIR_ENTRIES;
+  const std::uint32_t requiredSize =
+      offsetof(optional_header_64, DataDirectory) +
+      (static_cast<std::uint32_t>(header.NumberOfRvaAndSizes) *
+       sizeof(data_directory));
+  if (header.NumberOfRvaAndSizes > NUM_DIR_ENTRIES ||
+      requiredSize > optionalHeaderSize ||
+      !checkedTableRange(*b,
+                         offsetof(optional_header_64, DataDirectory),
+                         header.NumberOfRvaAndSizes,
+                         sizeof(data_directory))) {
+    PE_ERR(PEERR_HDR);
+    return false;
   }
 
   for (std::uint32_t i = 0; i < header.NumberOfRvaAndSizes; i++) {
-    std::uint32_t c = (i * sizeof(data_directory));
-    c += offsetof(optional_header_64, DataDirectory[0]);
+    std::uint32_t c;
+    if (!checkedTableOffset(offsetof(optional_header_64, DataDirectory[0]),
+                            i,
+                            sizeof(data_directory),
+                            c)) {
+      PE_ERR(PEERR_HDR);
+      return false;
+    }
     std::uint32_t o;
 
-    o = c + offsetof(data_directory, VirtualAddress);
+    if (!checkedAddU32(c, offsetof(data_directory, VirtualAddress), o)) {
+      PE_ERR(PEERR_HDR);
+      return false;
+    }
     if (!readDword(b, o, header.DataDirectory[i].VirtualAddress)) {
       return false;
     }
 
-    o = c + offsetof(data_directory, Size);
+    if (!checkedAddU32(c, offsetof(data_directory, Size), o)) {
+      PE_ERR(PEERR_HDR);
+      return false;
+    }
     if (!readDword(b, o, header.DataDirectory[i].Size)) {
       return false;
     }
@@ -1269,6 +1498,13 @@ bool readNtHeader(bounded_buffer *b, nt_header_32 &header) {
   /*
    * Read the Magic to determine if it is 32 or 64.
    */
+  if (header.FileHeader.SizeOfOptionalHeader < sizeof(std::uint16_t)) {
+    PE_ERR(PEERR_HDR);
+    deleteBuffer(ohb);
+    deleteBuffer(fhb);
+    return false;
+  }
+
   if (!readWord(ohb, 0, header.OptionalMagic)) {
     PE_ERR(PEERR_READ);
     if (ohb != nullptr) {
@@ -1278,13 +1514,16 @@ bool readNtHeader(bounded_buffer *b, nt_header_32 &header) {
     return false;
   }
   if (header.OptionalMagic == NT_OPTIONAL_32_MAGIC) {
-    if (!readOptionalHeader(ohb, header.OptionalHeader)) {
+    if (!readOptionalHeader(
+            ohb, header.OptionalHeader, header.FileHeader.SizeOfOptionalHeader)) {
       deleteBuffer(ohb);
       deleteBuffer(fhb);
       return false;
     }
   } else if (header.OptionalMagic == NT_OPTIONAL_64_MAGIC) {
-    if (!readOptionalHeader64(ohb, header.OptionalHeader64)) {
+    if (!readOptionalHeader64(
+            ohb, header.OptionalHeader64,
+            header.FileHeader.SizeOfOptionalHeader)) {
       deleteBuffer(ohb);
       deleteBuffer(fhb);
       return false;
@@ -1564,14 +1803,17 @@ bool getHeader(bounded_buffer *file, pe_header &p, bounded_buffer *&rem) {
    # correct size.
    */
   std::uint32_t rem_size;
-  if (p.nt.OptionalMagic == NT_OPTIONAL_32_MAGIC) {
-    // signature + file_header + optional_header_32
-    rem_size = sizeof(std::uint32_t) + sizeof(file_header) +
-               sizeof(optional_header_32);
-  } else if (p.nt.OptionalMagic == NT_OPTIONAL_64_MAGIC) {
-    // signature + file_header + optional_header_64
-    rem_size = sizeof(std::uint32_t) + sizeof(file_header) +
-               sizeof(optional_header_64);
+  const std::uint32_t fixedHeaderSize =
+      sizeof(std::uint32_t) + sizeof(file_header);
+  if (p.nt.OptionalMagic == NT_OPTIONAL_32_MAGIC ||
+      p.nt.OptionalMagic == NT_OPTIONAL_64_MAGIC) {
+    if (!checkedAddU32(fixedHeaderSize,
+                       p.nt.FileHeader.SizeOfOptionalHeader,
+                       rem_size)) {
+      PE_ERR(PEERR_HDR);
+      deleteBuffer(ntBuf);
+      return false;
+    }
   } else {
     PE_ERR(PEERR_MAGIC);
     deleteBuffer(ntBuf);
@@ -1593,16 +1835,25 @@ static bool parseExports(parsed_pe *p,
 
   section s;
   std::uint32_t rvaofft;
-  if (!getSectionForRVA(
-          sections, imageBase, exportDir.VirtualAddress, s, rvaofft)) {
+  if (!getSectionForRvaRange(sections,
+                             imageBase,
+                             exportDir.VirtualAddress,
+                             exportDir.Size,
+                             s,
+                             rvaofft) ||
+      !checkedTableRange(*s.sectionData,
+                         rvaofft,
+                         1,
+                         sizeof(export_dir_table))) {
     return false;
   }
 
   // get the name of this module
   std::uint32_t nameRva;
-  if (!readDword(s.sectionData,
-                 rvaofft + offsetof(export_dir_table, NameRVA),
-                 nameRva)) {
+  std::uint32_t nameRvaOffset;
+  if (!checkedAddU32(
+          rvaofft, offsetof(export_dir_table, NameRVA), nameRvaOffset) ||
+      !readDword(s.sectionData, nameRvaOffset, nameRva)) {
     return false;
   }
 
@@ -1613,8 +1864,12 @@ static bool parseExports(parsed_pe *p,
 
   // get the EAT section
   std::uint32_t addressTableEntries;
-  if (!readDword(s.sectionData,
-                 rvaofft + offsetof(export_dir_table, AddressTableEntries),
+  std::uint32_t addressTableEntriesOffset;
+  if (!checkedAddU32(rvaofft,
+                     offsetof(export_dir_table, AddressTableEntries),
+                     addressTableEntriesOffset) ||
+      !readDword(s.sectionData,
+                 addressTableEntriesOffset,
                  addressTableEntries)) {
     return false;
   }
@@ -1624,15 +1879,28 @@ static bool parseExports(parsed_pe *p,
   }
 
   std::uint32_t eatRVA;
-  if (!readDword(s.sectionData,
-                 rvaofft + offsetof(export_dir_table, ExportAddressTableRVA),
-                 eatRVA)) {
+  std::uint32_t eatRvaOffset;
+  if (!checkedAddU32(rvaofft,
+                     offsetof(export_dir_table, ExportAddressTableRVA),
+                     eatRvaOffset) ||
+      !readDword(s.sectionData, eatRvaOffset, eatRVA)) {
     return false;
   }
 
   section eatSec;
   std::uint32_t eatOff;
-  if (!getSectionForRVA(sections, imageBase, eatRVA, eatSec, eatOff)) {
+  if (!getSectionForRvaRange(sections,
+                             imageBase,
+                             eatRVA,
+                             static_cast<std::uint64_t>(addressTableEntries) *
+                                 sizeof(std::uint32_t),
+                             eatSec,
+                             eatOff) ||
+      !rvaRangeInDataDirectory(
+          eatRVA,
+          static_cast<std::uint64_t>(addressTableEntries) *
+              sizeof(std::uint32_t),
+          exportDir)) {
     return false;
   }
 
@@ -1642,43 +1910,65 @@ static bool parseExports(parsed_pe *p,
   // The name and ordinal tables annotate entries in the EAT. Preserve the
   // historic named-export iteration order, then emit unannotated EAT entries.
   std::uint32_t numNames;
-  if (!readDword(s.sectionData,
-                 rvaofft + offsetof(export_dir_table, NumberOfNamePointers),
-                 numNames)) {
+  std::uint32_t numNamesOffset;
+  if (!checkedAddU32(rvaofft,
+                     offsetof(export_dir_table, NumberOfNamePointers),
+                     numNamesOffset) ||
+      !readDword(s.sectionData, numNamesOffset, numNames)) {
     return false;
   }
 
   std::vector<named_export> namedExports;
   if (numNames > 0) {
+    namedExports.reserve(numNames);
     // get the names section
     std::uint32_t namesRVA;
-    if (!readDword(s.sectionData,
-                   rvaofft + offsetof(export_dir_table, NamePointerRVA),
-                   namesRVA)) {
+    std::uint32_t namesRvaOffset;
+    if (!checkedAddU32(rvaofft,
+                       offsetof(export_dir_table, NamePointerRVA),
+                       namesRvaOffset) ||
+        !readDword(s.sectionData, namesRvaOffset, namesRVA)) {
       return false;
     }
 
     section namesSec;
     std::uint32_t namesOff;
-    if (!getSectionForRVA(sections, imageBase, namesRVA, namesSec, namesOff)) {
+    const std::uint64_t namesBytes =
+        static_cast<std::uint64_t>(numNames) * sizeof(std::uint32_t);
+    if (!getSectionForRvaRange(sections,
+                               imageBase,
+                               namesRVA,
+                               namesBytes,
+                               namesSec,
+                               namesOff) ||
+        !rvaRangeInDataDirectory(namesRVA, namesBytes, exportDir)) {
       return false;
     }
 
     // get the ordinal table
     std::uint32_t ordinalTableRVA;
-    if (!readDword(s.sectionData,
-                   rvaofft + offsetof(export_dir_table, OrdinalTableRVA),
+    std::uint32_t ordinalTableRvaOffset;
+    if (!checkedAddU32(rvaofft,
+                       offsetof(export_dir_table, OrdinalTableRVA),
+                       ordinalTableRvaOffset) ||
+        !readDword(s.sectionData,
+                   ordinalTableRvaOffset,
                    ordinalTableRVA)) {
       return false;
     }
 
     section ordinalTableSec;
     std::uint32_t ordinalOff;
-    if (!getSectionForRVA(sections,
-                          imageBase,
-                          ordinalTableRVA,
-                          ordinalTableSec,
-                          ordinalOff)) {
+    const std::uint64_t ordinalBytes =
+        static_cast<std::uint64_t>(numNames) * sizeof(std::uint16_t);
+    if (!getSectionForRvaRange(sections,
+                               imageBase,
+                               ordinalTableRVA,
+                               ordinalBytes,
+                               ordinalTableSec,
+                               ordinalOff) ||
+        !rvaRangeInDataDirectory(
+            ordinalTableRVA, ordinalBytes, exportDir)) {
       return false;
     }
 
@@ -1695,7 +1985,8 @@ static bool parseExports(parsed_pe *p,
       }
 
       std::string symName;
-      if (!readRvaCString(sections, imageBase, curNameRVA, symName)) {
+      if (!rvaInDataDirectory(curNameRVA, exportDir) ||
+          !readRvaCString(sections, imageBase, curNameRVA, symName)) {
         return false;
       }
 
@@ -1720,7 +2011,8 @@ static bool parseExports(parsed_pe *p,
   }
 
   std::vector<std::uint32_t> namedExportIndexes;
-  namedExportIndexes.reserve(namedExports.size());
+  namedExportIndexes.reserve(numNames);
+  parsedExports.reserve(addressTableEntries);
   for (const named_export &namedExport : namedExports) {
     exportent a;
     if (!readExportEntry(exports, namedExport.eatIndex, a)) {
@@ -1777,9 +2069,13 @@ bool getExports(parsed_pe *p) {
     return true;
   }
 
+  if (exportDir.Size < sizeof(export_dir_table)) {
+    return false;
+  }
+
   std::vector<exportent> parsedExports;
   if (!parseExports(p, exportDir, imageBase, parsedExports)) {
-    return exportDir.Size == 0;
+    return false;
   }
 
   p->internal->exports.insert(
@@ -1797,86 +2093,108 @@ bool getRelocations(parsed_pe *p) {
     return false;
   }
 
-  if (relocDir.Size != 0) {
-    section d;
-    VA vaAddr;
-    if (p->peHeader.nt.OptionalMagic == NT_OPTIONAL_32_MAGIC) {
-      vaAddr =
-          relocDir.VirtualAddress + p->peHeader.nt.OptionalHeader.ImageBase;
-    } else if (p->peHeader.nt.OptionalMagic == NT_OPTIONAL_64_MAGIC) {
-      vaAddr =
-          relocDir.VirtualAddress + p->peHeader.nt.OptionalHeader64.ImageBase;
-    } else {
+  if (relocDir.Size == 0) {
+    return relocDir.VirtualAddress == 0;
+  }
+
+  if (relocDir.VirtualAddress == 0) {
+    return false;
+  }
+
+  section d;
+  std::uint32_t rvaofft;
+  VA relocImageBase;
+  if (!imageBaseForNtHeader(p->peHeader.nt, relocImageBase)) {
+    return false;
+  }
+  if (!getSectionForRvaRange(p->internal->secs,
+                             relocImageBase,
+                             relocDir.VirtualAddress,
+                             relocDir.Size,
+                             d,
+                             rvaofft)) {
+    return false;
+  }
+
+  std::uint32_t directoryOffset = 0;
+  while (directoryOffset < relocDir.Size) {
+    std::uint32_t blockOffset;
+    std::uint32_t pageRvaOffset;
+    std::uint32_t blockSizeOffset;
+    if (!checkedAddU32(rvaofft, directoryOffset, blockOffset) ||
+        !checkedAddU32(
+            blockOffset, offsetof(reloc_block, PageRVA), pageRvaOffset) ||
+        !checkedAddU32(blockOffset,
+                       offsetof(reloc_block, BlockSize),
+                       blockSizeOffset)) {
       return false;
     }
 
-    if (!getSecForVA(p->internal->secs, vaAddr, d)) {
+    std::uint32_t pageRva;
+    std::uint32_t blockSize;
+
+    if (!readDword(d.sectionData,
+                   pageRvaOffset,
+                   pageRva) ||
+        !readDword(d.sectionData,
+                   blockSizeOffset,
+                   blockSize) ||
+        blockSize < sizeof(reloc_block) ||
+        blockSize % sizeof(std::uint16_t) != 0 ||
+        blockSize > relocDir.Size - directoryOffset) {
       return false;
     }
 
-    auto rvaofft = static_cast<std::uint32_t>(vaAddr - d.sectionBase);
+    const std::uint32_t entryCount =
+        (blockSize - sizeof(reloc_block)) / sizeof(std::uint16_t);
+    p->internal->relocs.reserve(p->internal->relocs.size() + entryCount);
 
-    while (rvaofft < relocDir.Size) {
-      std::uint32_t pageRva;
-      std::uint32_t blockSize;
-
-      if (!readDword(d.sectionData,
-                     rvaofft + offsetof(reloc_block, PageRVA),
-                     pageRva)) {
+    std::uint32_t entryOffset;
+    if (!checkedAddU32(
+            directoryOffset, sizeof(reloc_block), entryOffset)) {
+      return false;
+    }
+    for (std::uint32_t i = 0; i < entryCount; ++i) {
+      std::uint32_t entryFileOffset;
+      if (!checkedAddU32(rvaofft, entryOffset, entryFileOffset)) {
         return false;
       }
 
-      if (!readDword(d.sectionData,
-                     rvaofft + offsetof(reloc_block, BlockSize),
-                     blockSize)) {
+      std::uint16_t entry;
+      if (!readWord(d.sectionData, entryFileOffset, entry)) {
         return false;
       }
 
-      // BlockSize - The total number of bytes in the base relocation block,
-      // including the Page RVA and Block Size fields and the Type/Offset fields
-      // that follow. Therefore we should subtract 8 bytes from BlockSize to
-      // exclude the Page RVA and Block Size fields.
-      std::uint32_t entryCount = (blockSize - 8) / sizeof(std::uint16_t);
+      const std::uint8_t type = entry >> 12;
+      const std::uint16_t offset = entry & static_cast<std::uint16_t>(~0xf000);
 
-      // Skip the Page RVA and Block Size fields
-      rvaofft += sizeof(reloc_block);
-
-      // Iterate over all of the block Type/Offset entries
-      while (entryCount != 0) {
-        std::uint16_t entry;
-        std::uint8_t type;
-        std::uint16_t offset;
-
-        if (!readWord(d.sectionData, rvaofft, entry)) {
-          return false;
-        }
-
-        // Mask out the type and assign
-        type = entry >> 12;
-        // Mask out the offset and assign
-        offset = entry & static_cast<std::uint16_t>(~0xf000);
-
-        // Produce the VA of the relocation
-        VA relocVA;
-        if (p->peHeader.nt.OptionalMagic == NT_OPTIONAL_32_MAGIC) {
-          relocVA = pageRva + offset + p->peHeader.nt.OptionalHeader.ImageBase;
-        } else if (p->peHeader.nt.OptionalMagic == NT_OPTIONAL_64_MAGIC) {
-          relocVA =
-              pageRva + offset + p->peHeader.nt.OptionalHeader64.ImageBase;
-        } else {
-          return false;
-        }
-
-        // Store in our list
-        reloc r;
-
-        r.shiftedAddr = relocVA;
-        r.type = static_cast<reloc_type>(type);
-        p->internal->relocs.push_back(r);
-
-        entryCount--;
-        rvaofft += sizeof(std::uint16_t);
+      VA relocVA;
+      VA imageBase;
+      if (p->peHeader.nt.OptionalMagic == NT_OPTIONAL_32_MAGIC) {
+        imageBase = p->peHeader.nt.OptionalHeader.ImageBase;
+      } else if (p->peHeader.nt.OptionalMagic == NT_OPTIONAL_64_MAGIC) {
+        imageBase = p->peHeader.nt.OptionalHeader64.ImageBase;
+      } else {
+        return false;
       }
+
+      std::uint64_t pageOffset;
+      if (!checkedAddU64(
+              static_cast<std::uint64_t>(pageRva), offset, pageOffset) ||
+          !checkedAddU64(imageBase, pageOffset, relocVA)) {
+        return false;
+      }
+
+      p->internal->relocs.push_back(
+          {relocVA, static_cast<reloc_type>(type)});
+      if (!checkedAddU32(
+              entryOffset, sizeof(std::uint16_t), entryOffset)) {
+        return false;
+      }
+    }
+
+    if (!checkedAddU32(directoryOffset, blockSize, directoryOffset)) {
+      return false;
     }
   }
 
@@ -1885,104 +2203,85 @@ bool getRelocations(parsed_pe *p) {
 
 bool getDebugDir(parsed_pe *p) {
   data_directory debugDir;
+  VA imageBase;
   if (p->peHeader.nt.OptionalMagic == NT_OPTIONAL_32_MAGIC) {
     debugDir = p->peHeader.nt.OptionalHeader.DataDirectory[DIR_DEBUG];
+    imageBase = p->peHeader.nt.OptionalHeader.ImageBase;
   } else if (p->peHeader.nt.OptionalMagic == NT_OPTIONAL_64_MAGIC) {
     debugDir = p->peHeader.nt.OptionalHeader64.DataDirectory[DIR_DEBUG];
+    imageBase = p->peHeader.nt.OptionalHeader64.ImageBase;
   } else {
     return false;
   }
 
-  if (debugDir.Size != 0) {
-    section d;
-    VA vaAddr;
-    if (p->peHeader.nt.OptionalMagic == NT_OPTIONAL_32_MAGIC) {
-      vaAddr =
-          debugDir.VirtualAddress + p->peHeader.nt.OptionalHeader.ImageBase;
-    } else if (p->peHeader.nt.OptionalMagic == NT_OPTIONAL_64_MAGIC) {
-      vaAddr =
-          debugDir.VirtualAddress + p->peHeader.nt.OptionalHeader64.ImageBase;
-    } else {
+  if (debugDir.Size == 0) {
+    return debugDir.VirtualAddress == 0;
+  }
+
+  if (debugDir.VirtualAddress == 0 ||
+      debugDir.Size % sizeof(debug_dir_entry) != 0) {
+    return false;
+  }
+
+  const std::uint32_t numOfDebugEnts =
+      debugDir.Size / sizeof(debug_dir_entry);
+  section d;
+  std::uint32_t rvaofft;
+  if (!getSectionForRvaRange(p->internal->secs,
+                             imageBase,
+                             debugDir.VirtualAddress,
+                             debugDir.Size,
+                             d,
+                             rvaofft)) {
+    return false;
+  }
+
+  p->internal->debugdirs.reserve(numOfDebugEnts);
+
+  for (std::uint32_t i = 0; i < numOfDebugEnts; i++) {
+    debug_dir_entry curEnt{};
+
+    READ_DWORD(d.sectionData, rvaofft, curEnt, Characteristics);
+    READ_DWORD(d.sectionData, rvaofft, curEnt, TimeStamp);
+    READ_WORD(d.sectionData, rvaofft, curEnt, MajorVersion);
+    READ_WORD(d.sectionData, rvaofft, curEnt, MinorVersion);
+    READ_DWORD(d.sectionData, rvaofft, curEnt, Type);
+    READ_DWORD(d.sectionData, rvaofft, curEnt, SizeOfData);
+    READ_DWORD(d.sectionData, rvaofft, curEnt, AddressOfRawData);
+    READ_DWORD(d.sectionData, rvaofft, curEnt, PointerToRawData);
+
+    if (curEnt.SizeOfData == 0 && curEnt.AddressOfRawData == 0 &&
+        curEnt.PointerToRawData == 0) {
+      break;
+    }
+
+    if (curEnt.SizeOfData == 0 || curEnt.AddressOfRawData == 0) {
       return false;
     }
 
-    uint32_t numOfDebugEnts = debugDir.Size / sizeof(debug_dir_entry);
-
-    //
-    // this will return the rdata section, where the debug directories are
-    //
-    if (!getSecForVA(p->internal->secs, vaAddr, d)) {
+    section dataSec;
+    std::uint32_t dataofft;
+    if (!getSectionForRvaRange(p->internal->secs,
+                               imageBase,
+                               curEnt.AddressOfRawData,
+                               curEnt.SizeOfData,
+                               dataSec,
+                               dataofft)) {
       return false;
     }
 
-    //
-    // get debug directory from this section
-    //
-    auto rvaofft = static_cast<std::uint32_t>(vaAddr - d.sectionBase);
+    debugent ent;
+    ent.data = splitBufferByLength(
+        dataSec.sectionData, dataofft, curEnt.SizeOfData);
+    if (ent.data == nullptr) {
+      return false;
+    }
+    ent.type = curEnt.Type;
 
-    debug_dir_entry emptyEnt;
-    memset(&emptyEnt, 0, sizeof(debug_dir_entry));
+    p->internal->debugdirs.push_back(ent);
 
-    for (uint32_t i = 0; i < numOfDebugEnts; i++) {
-      debug_dir_entry curEnt = emptyEnt;
-
-      READ_DWORD(d.sectionData, rvaofft, curEnt, Characteristics);
-      READ_DWORD(d.sectionData, rvaofft, curEnt, TimeStamp);
-      READ_WORD(d.sectionData, rvaofft, curEnt, MajorVersion);
-      READ_WORD(d.sectionData, rvaofft, curEnt, MinorVersion);
-      READ_DWORD(d.sectionData, rvaofft, curEnt, Type);
-      READ_DWORD(d.sectionData, rvaofft, curEnt, SizeOfData);
-      READ_DWORD(d.sectionData, rvaofft, curEnt, AddressOfRawData);
-      READ_DWORD(d.sectionData, rvaofft, curEnt, PointerToRawData);
-
-      // are all the fields in curEnt null? then we break
-      if (curEnt.SizeOfData == 0 && curEnt.AddressOfRawData == 0 &&
-          curEnt.PointerToRawData == 0) {
-        break;
-      }
-
-      //
-      // Get the address of the data
-      //
-      VA rawData;
-      if (p->peHeader.nt.OptionalMagic == NT_OPTIONAL_32_MAGIC) {
-        rawData =
-            curEnt.AddressOfRawData + p->peHeader.nt.OptionalHeader.ImageBase;
-      } else if (p->peHeader.nt.OptionalMagic == NT_OPTIONAL_64_MAGIC) {
-        rawData =
-            curEnt.AddressOfRawData + p->peHeader.nt.OptionalHeader64.ImageBase;
-      } else {
-        // Unrecognized optional header type. We can't process debug entries.
-        // Debug entries themselves are optional, so skip them.
-        break;
-      }
-
-      //
-      // Get the section for the data
-      //
-      section dataSec;
-      if (!getSecForVA(p->internal->secs, rawData, dataSec)) {
-        // The debug entry points to non-existing data. This means it is
-        // malformed. Skip it and the rest. They are not necessary for parsing
-        // the binary, and binaries do have malformed debug entries sometimes.
-        break;
-      }
-
-      debugent ent;
-
-      auto dataofft = static_cast<std::uint32_t>(rawData - dataSec.sectionBase);
-      ent.data =
-          splitBufferByLength(dataSec.sectionData, dataofft, curEnt.SizeOfData);
-      if (ent.data == nullptr) {
-        // The debug entry data stretches outside the containing section. It is
-        // malformed. Skip it and the rest, similar to the above.
-        break;
-      }
-      ent.type = curEnt.Type;
-
-      p->internal->debugdirs.push_back(ent);
-
-      rvaofft += sizeof(debug_dir_entry);
+    if (!checkedAddU32(rvaofft, sizeof(debug_dir_entry), rvaofft)) {
+      return false;
     }
   }
 
@@ -1991,567 +2290,297 @@ bool getDebugDir(parsed_pe *p) {
 
 bool getImports(parsed_pe *p) {
   data_directory importDir;
+  VA imageBase;
   if (p->peHeader.nt.OptionalMagic == NT_OPTIONAL_32_MAGIC) {
     importDir = p->peHeader.nt.OptionalHeader.DataDirectory[DIR_IMPORT];
+    imageBase = p->peHeader.nt.OptionalHeader.ImageBase;
   } else if (p->peHeader.nt.OptionalMagic == NT_OPTIONAL_64_MAGIC) {
     importDir = p->peHeader.nt.OptionalHeader64.DataDirectory[DIR_IMPORT];
+    imageBase = p->peHeader.nt.OptionalHeader64.ImageBase;
   } else {
     return false;
   }
 
-  if (importDir.Size != 0) {
-    // get section for the RVA in importDir
-    section c;
-    VA addr;
-    if (p->peHeader.nt.OptionalMagic == NT_OPTIONAL_32_MAGIC) {
-      addr = importDir.VirtualAddress + p->peHeader.nt.OptionalHeader.ImageBase;
-    } else if (p->peHeader.nt.OptionalMagic == NT_OPTIONAL_64_MAGIC) {
-      addr =
-          importDir.VirtualAddress + p->peHeader.nt.OptionalHeader64.ImageBase;
-    } else {
+  if (importDir.Size == 0) {
+    return importDir.VirtualAddress == 0;
+  }
+
+  if (importDir.VirtualAddress == 0 ||
+      importDir.Size % sizeof(import_dir_entry) != 0) {
+    return false;
+  }
+
+  section c;
+  std::uint32_t offt;
+  if (!getSectionForRvaRange(p->internal->secs,
+                             imageBase,
+                             importDir.VirtualAddress,
+                             importDir.Size,
+                             c,
+                             offt)) {
+    return false;
+  }
+
+  const std::uint32_t maxImportEntries =
+      importDir.Size / sizeof(import_dir_entry);
+  if (maxImportEntries == 0) {
+    return false;
+  }
+
+  bool foundTerminator = false;
+  const std::uint32_t entryWidth =
+      p->peHeader.nt.OptionalMagic == NT_OPTIONAL_64_MAGIC
+          ? sizeof(std::uint64_t)
+          : sizeof(std::uint32_t);
+
+  for (std::uint32_t descriptorIndex = 0;
+       descriptorIndex < maxImportEntries;
+       ++descriptorIndex) {
+    import_dir_entry curEnt{};
+
+    READ_DWORD(c.sectionData, offt, curEnt, LookupTableRVA);
+    READ_DWORD(c.sectionData, offt, curEnt, TimeStamp);
+    READ_DWORD(c.sectionData, offt, curEnt, ForwarderChain);
+    READ_DWORD(c.sectionData, offt, curEnt, NameRVA);
+    READ_DWORD(c.sectionData, offt, curEnt, AddressRVA);
+
+    if (curEnt.LookupTableRVA == 0 && curEnt.NameRVA == 0 &&
+        curEnt.AddressRVA == 0) {
+      foundTerminator = true;
+      break;
+    }
+
+    section nameSec;
+    std::uint32_t nameOff;
+    if (!getSectionForRVA(p->internal->secs,
+                          imageBase,
+                          curEnt.NameRVA,
+                          nameSec,
+                          nameOff)) {
       return false;
     }
 
-    if (!getSecForVA(p->internal->secs, addr, c)) {
+    std::string modName;
+    if (!readCString(*nameSec.sectionData, nameOff, modName)) {
       return false;
     }
 
-    // get import directory from this section
-    auto offt = static_cast<std::uint32_t>(addr - c.sectionBase);
+    std::transform(modName.begin(), modName.end(), modName.begin(), [](char chr) {
+      return static_cast<char>(::toupper(chr));
+    });
 
-    import_dir_entry emptyEnt;
-    memset(&emptyEnt, 0, sizeof(import_dir_entry));
+    const std::uint32_t lookupRva =
+        curEnt.LookupTableRVA != 0 ? curEnt.LookupTableRVA : curEnt.AddressRVA;
+    if (lookupRva == 0 || curEnt.AddressRVA == 0) {
+      return false;
+    }
 
-    do {
-      // read each directory entry out
-      import_dir_entry curEnt = emptyEnt;
+    section lookupSec;
+    std::uint32_t lookupOff;
+    if (!getSectionForRVA(p->internal->secs,
+                          imageBase,
+                          lookupRva,
+                          lookupSec,
+                          lookupOff)) {
+      return false;
+    }
 
-      READ_DWORD(c.sectionData, offt, curEnt, LookupTableRVA);
-      READ_DWORD(c.sectionData, offt, curEnt, TimeStamp);
-      READ_DWORD(c.sectionData, offt, curEnt, ForwarderChain);
-      READ_DWORD(c.sectionData, offt, curEnt, NameRVA);
-      READ_DWORD(c.sectionData, offt, curEnt, AddressRVA);
-
-      // are all the fields in curEnt null? then we break
-      if (curEnt.LookupTableRVA == 0 && curEnt.NameRVA == 0 &&
-          curEnt.AddressRVA == 0) {
-        break;
+    std::uint32_t offInTable = 0;
+    while (true) {
+      if (!checkedTableRange(*lookupSec.sectionData,
+                             lookupOff,
+                             1,
+                             entryWidth)) {
+        return false;
       }
 
-      // then, try and get the name of this particular module...
-      VA name;
+      std::uint8_t ord = 0;
+      std::uint16_t oval = 0;
+      VA valVA = 0;
+      std::uint32_t val32 = 0;
+      std::uint64_t val64 = 0;
+
       if (p->peHeader.nt.OptionalMagic == NT_OPTIONAL_32_MAGIC) {
-        name = curEnt.NameRVA + p->peHeader.nt.OptionalHeader.ImageBase;
+        if (!readDword(lookupSec.sectionData, lookupOff, val32)) {
+          return false;
+        }
+        if (val32 == 0) {
+          break;
+        }
+        ord = (val32 >> 31);
+        oval = (val32 & ~0xFFFF0000U);
+        if (ord == 0 && !checkedRvaToVA(imageBase, val32, valVA)) {
+          return false;
+        }
       } else if (p->peHeader.nt.OptionalMagic == NT_OPTIONAL_64_MAGIC) {
-        name = curEnt.NameRVA + p->peHeader.nt.OptionalHeader64.ImageBase;
+        if (!readQword(lookupSec.sectionData, lookupOff, val64)) {
+          return false;
+        }
+        if (val64 == 0) {
+          break;
+        }
+        ord = (val64 >> 63);
+        oval = static_cast<std::uint16_t>(val64 & 0xFFFFU);
+        if (ord == 0 && !checkedAddU64(imageBase, val64, valVA)) {
+          return false;
+        }
       } else {
         return false;
       }
 
-      section nameSec;
-      if (!getSecForVA(p->internal->secs, name, nameSec)) {
+      std::string symName;
+      if (ord == 0) {
+        section symNameSec;
+        if (!getSecForVA(p->internal->secs, valVA, symNameSec)) {
+          return false;
+        }
+
+        std::uint32_t nameOffset;
+        if (!checkedAddU32(
+                static_cast<std::uint32_t>(valVA - symNameSec.sectionBase),
+                sizeof(std::uint16_t),
+                nameOffset) ||
+            !readCString(*symNameSec.sectionData, nameOffset, symName)) {
+          return false;
+        }
+      } else {
+        symName = "ORDINAL_" + modName + "_" +
+                  to_string<std::uint32_t>(oval, std::dec);
+      }
+
+      importent ent;
+      if (!checkedAddU64(
+              imageBase,
+              static_cast<std::uint64_t>(curEnt.AddressRVA) + offInTable,
+              ent.addr)) {
         return false;
       }
+      ent.symbolName = symName;
+      ent.moduleName = modName;
+      p->internal->imports.push_back(ent);
 
-      auto nameOff = static_cast<std::uint32_t>(name - nameSec.sectionBase);
-      std::string modName;
-      if (!readCString(*nameSec.sectionData, nameOff, modName)) {
+      if (!checkedAddU32(lookupOff, entryWidth, lookupOff) ||
+          !checkedAddU32(offInTable, entryWidth, offInTable)) {
         return false;
       }
+    }
 
-      // clang-format off
-      std::transform(
-        modName.begin(),
-        modName.end(),
-        modName.begin(),
-
-        [](char chr) -> char {
-          return static_cast<char>(::toupper(chr));
-        }
-      );
-      // clang-format on
-
-      // then, try and get all of the sub-symbols
-      VA lookupVA = 0;
-      if (curEnt.LookupTableRVA != 0) {
-        if (p->peHeader.nt.OptionalMagic == NT_OPTIONAL_32_MAGIC) {
-          lookupVA =
-              curEnt.LookupTableRVA + p->peHeader.nt.OptionalHeader.ImageBase;
-        } else if (p->peHeader.nt.OptionalMagic == NT_OPTIONAL_64_MAGIC) {
-          lookupVA =
-              curEnt.LookupTableRVA + p->peHeader.nt.OptionalHeader64.ImageBase;
-        } else {
-          return false;
-        }
-      } else if (curEnt.AddressRVA != 0) {
-        if (p->peHeader.nt.OptionalMagic == NT_OPTIONAL_32_MAGIC) {
-          lookupVA =
-              curEnt.AddressRVA + p->peHeader.nt.OptionalHeader.ImageBase;
-        } else if (p->peHeader.nt.OptionalMagic == NT_OPTIONAL_64_MAGIC) {
-          lookupVA =
-              curEnt.AddressRVA + p->peHeader.nt.OptionalHeader64.ImageBase;
-        } else {
-          return false;
-        }
-      }
-
-      section lookupSec;
-      if (lookupVA == 0 ||
-          !getSecForVA(p->internal->secs, lookupVA, lookupSec)) {
-        return false;
-      }
-
-      auto lookupOff =
-          static_cast<std::uint32_t>(lookupVA - lookupSec.sectionBase);
-      std::uint32_t offInTable = 0;
-      do {
-        VA valVA = 0;
-        std::uint8_t ord = 0;
-        std::uint16_t oval = 0;
-        std::uint32_t val32 = 0;
-        std::uint64_t val64 = 0;
-        if (p->peHeader.nt.OptionalMagic == NT_OPTIONAL_32_MAGIC) {
-          if (!readDword(lookupSec.sectionData, lookupOff, val32)) {
-            return false;
-          }
-          if (val32 == 0) {
-            break;
-          }
-          ord = (val32 >> 31);
-          oval = (val32 & ~0xFFFF0000);
-          valVA = val32 + p->peHeader.nt.OptionalHeader.ImageBase;
-        } else if (p->peHeader.nt.OptionalMagic == NT_OPTIONAL_64_MAGIC) {
-          if (!readQword(lookupSec.sectionData, lookupOff, val64)) {
-            return false;
-          }
-          if (val64 == 0) {
-            break;
-          }
-          ord = (val64 >> 63);
-          oval = (val64 & ~0xFFFF0000);
-          valVA = val64 + p->peHeader.nt.OptionalHeader64.ImageBase;
-        } else {
-          return false;
-        }
-
-        if (ord == 0) {
-          // import by name
-          std::string symName;
-          section symNameSec;
-
-          if (!getSecForVA(p->internal->secs, valVA, symNameSec)) {
-            return false;
-          }
-
-          std::uint32_t nameOffset =
-              static_cast<std::uint32_t>(valVA - symNameSec.sectionBase) +
-              sizeof(std::uint16_t);
-          do {
-            std::uint8_t chr;
-            if (!readByte(symNameSec.sectionData, nameOffset, chr)) {
-              return false;
-            }
-
-            if (chr == 0) {
-              break;
-            }
-
-            symName.push_back(static_cast<char>(chr));
-            nameOffset++;
-          } while (true);
-
-          // okay now we know the pair... add it
-          importent ent;
-
-          if (p->peHeader.nt.OptionalMagic == NT_OPTIONAL_32_MAGIC) {
-            ent.addr = offInTable + curEnt.AddressRVA +
-                       p->peHeader.nt.OptionalHeader.ImageBase;
-          } else if (p->peHeader.nt.OptionalMagic == NT_OPTIONAL_64_MAGIC) {
-            ent.addr = offInTable + curEnt.AddressRVA +
-                       p->peHeader.nt.OptionalHeader64.ImageBase;
-          } else {
-            return false;
-          }
-
-          ent.symbolName = symName;
-          ent.moduleName = modName;
-          p->internal->imports.push_back(ent);
-        } else {
-          std::string symName = "ORDINAL_" + modName + "_" +
-                                to_string<std::uint32_t>(oval, std::dec);
-
-          importent ent;
-
-          if (p->peHeader.nt.OptionalMagic == NT_OPTIONAL_32_MAGIC) {
-            ent.addr = offInTable + curEnt.AddressRVA +
-                       p->peHeader.nt.OptionalHeader.ImageBase;
-          } else if (p->peHeader.nt.OptionalMagic == NT_OPTIONAL_64_MAGIC) {
-            ent.addr = offInTable + curEnt.AddressRVA +
-                       p->peHeader.nt.OptionalHeader64.ImageBase;
-          } else {
-            return false;
-          }
-
-          ent.symbolName = symName;
-          ent.moduleName = modName;
-
-          p->internal->imports.push_back(ent);
-        }
-
-        if (p->peHeader.nt.OptionalMagic == NT_OPTIONAL_32_MAGIC) {
-          lookupOff += sizeof(std::uint32_t);
-          offInTable += sizeof(std::uint32_t);
-        } else if (p->peHeader.nt.OptionalMagic == NT_OPTIONAL_64_MAGIC) {
-          lookupOff += sizeof(std::uint64_t);
-          offInTable += sizeof(std::uint64_t);
-        } else {
-          return false;
-        }
-      } while (true);
-
-      offt += sizeof(import_dir_entry);
-    } while (true);
+    if (!checkedAddU32(offt, sizeof(import_dir_entry), offt)) {
+      return false;
+    }
   }
 
-  return true;
+  return foundTerminator;
 }
 
-bool getSymbolTable(parsed_pe *p) {
+static bool validateSymbolTable(const parsed_pe *p) {
   if (p->peHeader.nt.FileHeader.PointerToSymbolTable == 0) {
+    return p->peHeader.nt.FileHeader.NumberOfSymbols == 0;
+  }
+
+  std::uint64_t symbolTableEnd;
+  return checkedTableRange(
+      p->peHeader.nt.FileHeader.PointerToSymbolTable,
+      p->peHeader.nt.FileHeader.NumberOfSymbols,
+      SYMTAB_RECORD_LEN,
+      p->fileBuffer->bufLen,
+      symbolTableEnd);
+}
+
+static bool iterateSymbolTable(parsed_pe *p, iterSymbol cb, void *cbd) {
+  const auto pointerToSymbolTable =
+      p->peHeader.nt.FileHeader.PointerToSymbolTable;
+  const auto numberOfSymbols = p->peHeader.nt.FileHeader.NumberOfSymbols;
+  if (pointerToSymbolTable == 0) {
     return true;
   }
 
-  std::uint32_t strTableOffset =
-      p->peHeader.nt.FileHeader.PointerToSymbolTable +
-      (p->peHeader.nt.FileHeader.NumberOfSymbols * SYMTAB_RECORD_LEN);
+  std::uint32_t strTableOffset;
+  if (!checkedAddU32(
+          pointerToSymbolTable,
+          static_cast<std::uint64_t>(numberOfSymbols) * SYMTAB_RECORD_LEN,
+          strTableOffset)) {
+    return false;
+  }
 
-  std::uint32_t offset = p->peHeader.nt.FileHeader.PointerToSymbolTable;
-
-  for (std::uint32_t i = 0; i < p->peHeader.nt.FileHeader.NumberOfSymbols;
-       i++) {
-    symbol sym;
-
-    // Read name
-    if (!readQword(p->fileBuffer, offset, sym.name.data)) {
-      PE_ERR(PEERR_MAGIC);
+  std::uint32_t offset = pointerToSymbolTable;
+  std::uint32_t index = 0;
+  while (index < numberOfSymbols) {
+    symbol_name name{};
+    if (!readQword(p->fileBuffer, offset, name.data)) {
       return false;
     }
 
-    if (sym.name.zeroes == 0) {
-      // The symbol name is greater than 8 bytes so it is stored in the string
-      // table. In this case instead of name, an offset of the string in the
-      // string table is provided.
-
-      uint32_t strOffset = strTableOffset + SYMBOL_NAME_OFFSET(sym.name);
-      uint8_t ch;
-      for (;;) {
-        if (!readByte(p->fileBuffer, strOffset, ch)) {
-          PE_ERR(PEERR_MAGIC);
-          return false;
-        }
-        if (ch == 0u) {
-          break;
-        }
-        sym.strName.push_back(static_cast<char>(ch));
-        strOffset += sizeof(std::uint8_t);
+    std::string strName;
+    if (name.zeroes == 0) {
+      std::uint32_t strOffset;
+      if (!checkedAddU32(
+              strTableOffset, SYMBOL_NAME_OFFSET(name), strOffset) ||
+          !readCString(*p->fileBuffer, strOffset, strName)) {
+        return false;
       }
     } else {
       for (std::uint8_t n = 0;
-           n < NT_SHORT_NAME_LEN && sym.name.shortName[n] != 0;
-           n++) {
-        sym.strName.push_back(static_cast<char>(sym.name.shortName[n]));
+           n < NT_SHORT_NAME_LEN && name.shortName[n] != 0;
+           ++n) {
+        strName.push_back(static_cast<char>(name.shortName[n]));
       }
     }
 
-    offset += sizeof(std::uint64_t);
-
-    // Read value
-    if (!readDword(p->fileBuffer, offset, sym.value)) {
-      PE_ERR(PEERR_MAGIC);
+    std::uint32_t value;
+    std::uint16_t sectionNumberRaw;
+    std::uint16_t type;
+    std::uint8_t storageClass;
+    std::uint8_t numberOfAuxSymbols;
+    std::uint32_t valueOffset;
+    std::uint32_t sectionOffset;
+    std::uint32_t typeOffset;
+    std::uint32_t storageClassOffset;
+    std::uint32_t auxCountOffset;
+    if (!checkedAddU32(offset, 8, valueOffset) ||
+        !checkedAddU32(offset, 10, sectionOffset) ||
+        !checkedAddU32(offset, 12, typeOffset) ||
+        !checkedAddU32(offset, 14, storageClassOffset) ||
+        !checkedAddU32(offset, 15, auxCountOffset) ||
+        !readDword(p->fileBuffer, valueOffset, value) ||
+        !readWord(p->fileBuffer, sectionOffset, sectionNumberRaw) ||
+        !readWord(p->fileBuffer, typeOffset, type) ||
+        !readByte(p->fileBuffer, storageClassOffset, storageClass) ||
+        !readByte(p->fileBuffer, auxCountOffset, numberOfAuxSymbols)) {
       return false;
     }
 
-    offset += sizeof(std::uint32_t);
-
-    // Read section number
-    uint16_t secNum;
-    if (!readWord(p->fileBuffer, offset, secNum)) {
-      PE_ERR(PEERR_MAGIC);
-      return false;
-    }
-    sym.sectionNumber = static_cast<std::int16_t>(secNum);
-
-    offset += sizeof(std::uint16_t);
-
-    // Read type
-    if (!readWord(p->fileBuffer, offset, sym.type)) {
-      PE_ERR(PEERR_MAGIC);
-      return false;
+    const auto sectionNumber =
+        static_cast<std::int16_t>(sectionNumberRaw);
+    if (cb(cbd,
+           strName,
+           value,
+           sectionNumber,
+           type,
+           storageClass,
+           numberOfAuxSymbols) != 0) {
+      return true;
     }
 
-    offset += sizeof(std::uint16_t);
-
-    // Read storage class
-    if (!readByte(p->fileBuffer, offset, sym.storageClass)) {
-      PE_ERR(PEERR_MAGIC);
+    if (numberOfAuxSymbols > numberOfSymbols - index) {
       return false;
     }
 
-    offset += sizeof(std::uint8_t);
-
-    // Read number of auxiliary symbols
-    if (!readByte(p->fileBuffer, offset, sym.numberOfAuxSymbols)) {
-      PE_ERR(PEERR_MAGIC);
+    std::uint32_t nextOffset;
+    if (!checkedAddU32(
+            offset,
+            static_cast<std::uint64_t>(numberOfAuxSymbols + 1) *
+                SYMTAB_RECORD_LEN,
+            nextOffset) ||
+        nextOffset > strTableOffset) {
       return false;
     }
 
-    // Set offset to next symbol
-    offset += sizeof(std::uint8_t);
-
-    // Save the symbol
-    p->internal->symbols.push_back(sym);
-
-    if (sym.numberOfAuxSymbols == 0) {
-      continue;
-    }
-
-    // Read auxiliary symbol records
-    auto nextSymbolOffset =
-        offset + (static_cast<std::uint32_t>(sym.numberOfAuxSymbols) *
-                  static_cast<std::uint32_t>(SYMTAB_RECORD_LEN));
-
-    i += sym.numberOfAuxSymbols;
-
-    if (sym.storageClass == IMAGE_SYM_CLASS_EXTERNAL &&
-        SYMBOL_TYPE_HI(sym) == 0x20 && sym.sectionNumber > 0) {
-      // Auxiliary Format 1: Function Definitions
-
-      for (std::uint8_t n = 0; n < sym.numberOfAuxSymbols; n++) {
-        aux_symbol_f1 asym;
-
-        // Read tag index
-        if (!readDword(p->fileBuffer, offset, asym.tagIndex)) {
-          PE_ERR(PEERR_MAGIC);
-          return false;
-        }
-
-        offset += sizeof(std::uint32_t);
-
-        // Read total size
-        if (!readDword(p->fileBuffer, offset, asym.totalSize)) {
-          PE_ERR(PEERR_MAGIC);
-          return false;
-        }
-
-        offset += sizeof(std::uint32_t);
-
-        // Read pointer to line number
-        if (!readDword(p->fileBuffer, offset, asym.pointerToLineNumber)) {
-          PE_ERR(PEERR_MAGIC);
-          return false;
-        }
-
-        offset += sizeof(std::uint32_t);
-
-        // Read pointer to next function
-        if (!readDword(p->fileBuffer, offset, asym.pointerToNextFunction)) {
-          PE_ERR(PEERR_MAGIC);
-          return false;
-        }
-
-        // Skip the processed 4 bytes + unused 2 bytes
-        offset += sizeof(std::uint8_t) * 6;
-
-        // Save the record
-        sym.aux_symbols_f1.push_back(asym);
-      }
-
-    } else if (sym.storageClass == IMAGE_SYM_CLASS_FUNCTION) {
-      // Auxiliary Format 2: .bf and .ef Symbols
-
-      for (std::uint8_t n = 0; n < sym.numberOfAuxSymbols; n++) {
-        aux_symbol_f2 asym;
-        // Skip unused 4 bytes
-        offset += sizeof(std::uint32_t);
-
-        // Read line number
-        if (!readWord(p->fileBuffer, offset, asym.lineNumber)) {
-          PE_ERR(PEERR_MAGIC);
-          return false;
-        }
-
-        offset += sizeof(std::uint16_t);
-
-        // Skip unused 6 bytes
-        offset += sizeof(std::uint8_t) * 6;
-
-        // Read pointer to next function
-        if (!readDword(p->fileBuffer, offset, asym.pointerToNextFunction)) {
-          PE_ERR(PEERR_MAGIC);
-          return false;
-        }
-
-        // Skip the processed 4 bytes + unused 2 bytes
-        offset += sizeof(std::uint8_t) * 6;
-
-        // Save the record
-        sym.aux_symbols_f2.push_back(asym);
-      }
-
-    } else if (sym.storageClass == IMAGE_SYM_CLASS_EXTERNAL &&
-               sym.sectionNumber == IMAGE_SYM_UNDEFINED && sym.value == 0) {
-      // Auxiliary Format 3: Weak Externals
-
-      for (std::uint8_t n = 0; n < sym.numberOfAuxSymbols; n++) {
-        aux_symbol_f3 asym;
-
-        // Read line number
-        if (!readDword(p->fileBuffer, offset, asym.tagIndex)) {
-          PE_ERR(PEERR_MAGIC);
-          return false;
-        }
-
-        // Read characteristics
-        if (!readDword(p->fileBuffer, offset, asym.characteristics)) {
-          PE_ERR(PEERR_MAGIC);
-          return false;
-        }
-
-        // Skip unused 10 bytes
-        offset += sizeof(std::uint8_t) * 10;
-
-        // Save the record
-        sym.aux_symbols_f3.push_back(asym);
-      }
-
-    } else if (sym.storageClass == IMAGE_SYM_CLASS_FILE) {
-      // Auxiliary Format 4: Files
-
-      for (std::uint8_t n = 0; n < sym.numberOfAuxSymbols; n++) {
-        aux_symbol_f4 asym;
-
-        // Read filename
-        bool terminatorFound = false;
-
-        for (std::uint16_t j = 0; j < SYMTAB_RECORD_LEN; j++) {
-          // Save the raw field
-          if (!readByte(p->fileBuffer, offset, asym.filename[j])) {
-            PE_ERR(PEERR_MAGIC);
-            return false;
-          }
-
-          offset += sizeof(std::uint8_t);
-
-          if (asym.filename[j] == 0) {
-            terminatorFound = true;
-          }
-
-          if (!terminatorFound) {
-            asym.strFilename.push_back(static_cast<char>(asym.filename[j]));
-          }
-        }
-
-        // Save the record
-        sym.aux_symbols_f4.push_back(asym);
-      }
-
-    } else if (sym.storageClass == IMAGE_SYM_CLASS_STATIC) {
-      // Auxiliary Format 5: Section Definitions
-
-      for (std::uint8_t n = 0; n < sym.numberOfAuxSymbols; n++) {
-        aux_symbol_f5 asym;
-
-        // Read length
-        if (!readDword(p->fileBuffer, offset, asym.length)) {
-          PE_ERR(PEERR_MAGIC);
-          return false;
-        }
-
-        offset += sizeof(std::uint32_t);
-
-        // Read number of relocations
-        if (!readWord(p->fileBuffer, offset, asym.numberOfRelocations)) {
-          PE_ERR(PEERR_MAGIC);
-          return false;
-        }
-
-        offset += sizeof(std::uint16_t);
-
-        // Read number of line numbers
-        if (!readWord(p->fileBuffer, offset, asym.numberOfLineNumbers)) {
-          PE_ERR(PEERR_MAGIC);
-          return false;
-        }
-
-        offset += sizeof(std::uint16_t);
-
-        // Read checksum
-        if (!readDword(p->fileBuffer, offset, asym.checkSum)) {
-          PE_ERR(PEERR_MAGIC);
-          return false;
-        }
-
-        offset += sizeof(std::uint32_t);
-
-        // Read number
-        if (!readWord(p->fileBuffer, offset, asym.number)) {
-          PE_ERR(PEERR_MAGIC);
-          return false;
-        }
-
-        offset += sizeof(std::uint16_t);
-
-        // Read selection
-        if (!readByte(p->fileBuffer, offset, asym.selection)) {
-          PE_ERR(PEERR_MAGIC);
-          return false;
-        }
-
-        offset += sizeof(std::uint8_t);
-
-        // Skip unused 3 bytes
-        offset += sizeof(std::uint8_t) * 3;
-
-        // Save the record
-        sym.aux_symbols_f5.push_back(asym);
-      }
-
-    } else {
-#ifdef PEPARSE_LIBRARY_WARNINGS
-      std::ios::fmtflags originalStreamFlags(std::cerr.flags());
-
-      auto storageClassName = GetSymbolTableStorageClassName(sym.storageClass);
-      if (storageClassName == nullptr) {
-        std::cerr << "Warning: Skipping auxiliary symbol of type 0x" << std::hex
-                  << static_cast<std::uint32_t>(sym.storageClass)
-                  << " at offset 0x" << std::hex << offset << "\n";
-      } else {
-
-        std::cerr << "Warning: Skipping auxiliary symbol of type "
-                  << storageClassName << " at offset 0x" << std::hex << offset
-                  << "\n";
-      }
-
-      std::cerr.flags(originalStreamFlags);
-#endif
-      offset = nextSymbolOffset;
-    }
-
-    if (offset != nextSymbolOffset) {
-#ifdef PEPARSE_LIBRARY_WARNINGS
-      std::ios::fmtflags originalStreamFlags(std::cerr.flags());
-
-      std::cerr << "Warning: Invalid internal offset (current: 0x" << std::hex
-                << offset << ", expected: 0x" << std::hex << nextSymbolOffset
-                << ")\n";
-
-      std::cerr.flags(originalStreamFlags);
-#endif
-      offset = nextSymbolOffset;
-    }
+    offset = nextOffset;
+    index += static_cast<std::uint32_t>(numberOfAuxSymbols) + 1;
   }
 
-  return true;
+  return offset == strTableOffset;
 }
 
 parsed_pe *ParsePEFromBuffer(bounded_buffer *buffer) {
@@ -2631,8 +2660,9 @@ parsed_pe *ParsePEFromBuffer(bounded_buffer *buffer) {
     return nullptr;
   }
 
-  // Get symbol table
-  if (!getSymbolTable(p)) {
+  // Validate the symbol table. Entries are read lazily by IterSymbols.
+  if (!validateSymbolTable(p)) {
+    PE_ERR(PEERR_HDR);
     deleteBuffer(remaining);
     DestructParsedPE(p);
     return nullptr;
@@ -2732,21 +2762,9 @@ void IterDebugs(parsed_pe *pe, iterDebug cb, void *cbd) {
 
 // Iterate over symbols (symbol table) in the PE file
 void IterSymbols(parsed_pe *pe, iterSymbol cb, void *cbd) {
-  std::vector<symbol> &l = pe->internal->symbols;
-
-  for (symbol &s : l) {
-    if (cb(cbd,
-           s.strName,
-           s.value,
-           s.sectionNumber,
-           s.type,
-           s.storageClass,
-           s.numberOfAuxSymbols) != 0) {
-      break;
-    }
+  if (!iterateSymbolTable(pe, cb, cbd)) {
+    PE_ERR(PEERR_READ);
   }
-
-  return;
 }
 
 // iterate over the exports by VA
@@ -2911,10 +2929,22 @@ bool GetDataDirectoryEntry(parsed_pe *pe,
   VA addr;
   if (pe->peHeader.nt.OptionalMagic == NT_OPTIONAL_32_MAGIC) {
     dir = pe->peHeader.nt.OptionalHeader.DataDirectory[dirnum];
-    addr = dir.VirtualAddress + pe->peHeader.nt.OptionalHeader.ImageBase;
+    if (!checkedRvaToVA(
+            pe->peHeader.nt.OptionalHeader.ImageBase,
+            dir.VirtualAddress,
+            addr)) {
+      PE_ERR(PEERR_ADDRESS);
+      return false;
+    }
   } else if (pe->peHeader.nt.OptionalMagic == NT_OPTIONAL_64_MAGIC) {
     dir = pe->peHeader.nt.OptionalHeader64.DataDirectory[dirnum];
-    addr = dir.VirtualAddress + pe->peHeader.nt.OptionalHeader64.ImageBase;
+    if (!checkedRvaToVA(
+            pe->peHeader.nt.OptionalHeader64.ImageBase,
+            dir.VirtualAddress,
+            addr)) {
+      PE_ERR(PEERR_ADDRESS);
+      return false;
+    }
   } else {
     PE_ERR(PEERR_MAGIC);
     return false;

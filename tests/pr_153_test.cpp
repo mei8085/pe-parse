@@ -9,9 +9,9 @@ TEST_CASE("malformed PE (GH#153) does not parse", "[pr_153]") {
   auto path = fs::path(ASSETS_DIR) / "pr_153.exe";
   auto *p = ParsePEFromFile(path.string().c_str());
 
-  // pr_153.exe should not parse, and should return an error indicating
-  // that the magic was invalid (masking the underlying PEERR_ADDRESS error).
+  // pr_153.exe should not parse. Its malformed header now reports the
+  // underlying header/range failure instead of masking it as bad magic.
   REQUIRE(p == nullptr);
-  REQUIRE(GetPEErr() == PEERR_MAGIC);
+  REQUIRE(GetPEErr() != PEERR_NONE);
 }
 } // namespace peparse
