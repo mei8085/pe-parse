@@ -558,6 +558,31 @@ int main(int argc, char *argv[]) {
               << "\n";
     IterRsrc(p, printRsrc, NULL);
 
+    std::cout << "Load configuration (mitigations): "
+              << "\n";
+    mitigation_metadata mitigation;
+    if (GetMitigationMetadata(p, mitigation)) {
+      std::cout << "Status: " << GetMitigationStatusAsString(mitigation.status)
+                << "\n";
+      std::cout << "DllCharacteristics: 0x" << std::hex
+                << mitigation.dllCharacteristics << std::dec << "\n";
+      std::cout << "ASLR: " << std::boolalpha << mitigation.aslr
+                << " DEP: " << mitigation.dep
+                << " CFG: " << mitigation.controlFlowGuard << "\n";
+      if (mitigation.hasGuardFlags) {
+        std::cout << "GuardFlags: 0x" << std::hex << mitigation.guardFlags
+                  << std::dec << "\n";
+      }
+      if (mitigation.hasGuardCFFunctionTable) {
+        std::cout << "CFG function table RVA: 0x" << std::hex
+                  << mitigation.guardCFFunctionTableRVA << std::dec
+                  << " count: " << mitigation.guardCFFunctionCount
+                  << " stride: " << mitigation.guardCFFunctionTableStride
+                  << " valid: " << std::boolalpha
+                  << mitigation.guardCFFunctionTableValid << "\n";
+      }
+    }
+
     DestructParsedPE(p);
 
     return 0;

@@ -18,6 +18,7 @@ pe-parse supports these use cases via a minimal API that provides methods for
  * Iterating over resources
  * Reading bytes from specified virtual addresses
  * Retrieving the program entry point
+ * Resolving the load configuration mitigation metadata (`GetMitigationMetadata`)
 
 The interface is defined in `parser-library/parse.h`.
 

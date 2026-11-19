@@ -2962,4 +2962,562 @@ bool GetDataDirectoryEntry(parsed_pe *pe,
   return true;
 }
 
+const char *GetMitigationStatusAsString(mitigation_status status) {
+  switch (status) {
+    case MITIGATION_ABSENT:
+      return "absent";
+    case MITIGATION_TRUNCATED:
+      return "truncated";
+    case MITIGATION_INCONSISTENT:
+      return "inconsistent";
+    case MITIGATION_CONSISTENT:
+      return "consistent";
+    default:
+      return "unknown";
+  }
+}
+
+// Resolve a VA to the file-backed bytes of its containing section. Returns
+// false when the VA is not mapped, when the mapping has no data, or when the
+// resulting offset would not fit into the 32-bit offsets used by the readers.
+static bool sectionRangeAt(const std::vector<section> &secs,
+                           VA addr,
+                           bounded_buffer *&buffer,
+                           std::uint32_t &offset,
+                           std::uint32_t &available) {
+  section sec;
+  if (!getSecForVA(secs, addr, sec) || sec.sectionData == nullptr) {
+    return false;
+  }
+
+  const VA delta = addr - sec.sectionBase;
+  if (delta > std::numeric_limits<std::uint32_t>::max()) {
+    return false;
+  }
+
+  const auto off = static_cast<std::uint32_t>(delta);
+  if (off > sec.sectionData->bufLen) {
+    return false;
+  }
+
+  buffer = sec.sectionData;
+  offset = off;
+  available = sec.sectionData->bufLen - off;
+  return true;
+}
+
+// Read one fixed-width field of the load configuration structure supplied by
+// the PE. The field is only read when its complete width lies inside the
+// coverage window, which is derived from the structure's own Size member. This
+// is what keeps a field that a shorter, older structure does not define from
+// being read at all.
+static bool readLoadConfigField(bounded_buffer *buffer,
+                                std::uint32_t base,
+                                std::uint32_t coverage,
+                                std::uint32_t fieldOffset,
+                                std::uint32_t fieldSize,
+                                std::uint64_t &value) {
+  if (fieldOffset > coverage || fieldSize > coverage - fieldOffset) {
+    return false;
+  }
+
+  const std::uint32_t absOffset = base + fieldOffset;
+  if (fieldSize == sizeof(std::uint32_t)) {
+    std::uint32_t narrow = 0;
+    if (!readDword(buffer, absOffset, narrow)) {
+      return false;
+    }
+    value = narrow;
+    return true;
+  }
+
+  if (fieldSize == sizeof(std::uint64_t)) {
+    std::uint64_t wide = 0;
+    if (!readQword(buffer, absOffset, wide)) {
+      return false;
+    }
+    value = wide;
+    return true;
+  }
+
+  return false;
+}
+
+struct mitigation_table_check {
+  // The declared table contradicts its presence flag.
+  bool flagConflict;
+  // The declared table is not fully backed by file data.
+  bool truncated;
+  // The declared table is completely present and bounded.
+  bool valid;
+  // RVA form of the table pointer, when it could be derived.
+  std::uint32_t rva;
+};
+
+// How a table's presence must agree with its GuardFlags bit.
+enum class table_flag_rule {
+  // The table has no corresponding GuardFlags bit.
+  IGNORE,
+  // A set flag requires a declared table, and a declared table requires the
+  // flag to be set.
+  REQUIRED,
+  // A set flag requires a declared table; a declared table is allowed even
+  // without the flag.
+  REQUIRED_WHEN_FLAGGED,
+};
+
+// Validate one table referenced by the load configuration.
+//
+// pointer : the declared VA of the table
+// count   : the declared number of entries
+// stride  : the declared number of bytes per entry
+// flagSet : whether the table's GuardFlags presence bit is set
+// flagsAvailable : whether GuardFlags is part of the structure at all
+// rule    : how the table's presence must agree with the GuardFlags bit
+//
+// A table is only valid when the pointer converts to an RVA, maps into a
+// section, and the whole count * stride range lies inside that section's
+// file-backed data. Anything else is either an undeclared table (flag
+// conflict) or a table whose bytes are not available (truncation). Data that
+// happens to follow the table inside the section is never included.
+static mitigation_table_check
+checkMitigationTable(const std::vector<section> &secs,
+                     VA imageBase,
+                     std::uint64_t pointer,
+                     std::uint64_t count,
+                     std::uint32_t stride,
+                     bool flagSet,
+                     bool flagsAvailable,
+                     table_flag_rule rule) {
+  mitigation_table_check check{};
+
+  const bool declared = pointer != 0 || count != 0;
+  const bool presentFlagSaysTable =
+      rule != table_flag_rule::IGNORE && flagsAvailable && flagSet;
+
+  if (presentFlagSaysTable && !declared) {
+    check.flagConflict = true;
+    return check;
+  }
+
+  if (rule == table_flag_rule::REQUIRED && flagsAvailable && !flagSet &&
+      declared) {
+    check.flagConflict = true;
+    return check;
+  }
+
+  if (!declared) {
+    return check;
+  }
+
+  // A half-declared table cannot describe any entries.
+  if (pointer == 0 || count == 0 || stride == 0) {
+    check.flagConflict = true;
+    return check;
+  }
+
+  if (pointer < imageBase ||
+      pointer - imageBase > std::numeric_limits<std::uint32_t>::max()) {
+    check.truncated = true;
+    return check;
+  }
+
+  bounded_buffer *buffer = nullptr;
+  std::uint32_t offset = 0;
+  std::uint32_t available = 0;
+  if (!sectionRangeAt(
+          secs, static_cast<VA>(pointer), buffer, offset, available)) {
+    check.truncated = true;
+    return check;
+  }
+
+  // Reject any table that is not wholly contained in its section. The
+  // division also guards against multiplication overflow.
+  if (count > available / stride) {
+    check.truncated = true;
+    return check;
+  }
+
+  check.valid = true;
+  check.rva = static_cast<std::uint32_t>(pointer - imageBase);
+  return check;
+}
+
+// A reader for one load configuration structure revision. Each field is
+// fetched through readLoadConfigField, so fields that the revision's Size does
+// not cover stay unavailable instead of being read as garbage.
+template <typename LoadConfig> struct load_config_reader {
+  bounded_buffer *buffer;
+  std::uint32_t base;
+  std::uint32_t coverage;
+
+  bool readField(std::uint32_t fieldOffset,
+                 std::uint32_t fieldSize,
+                 std::uint64_t &value) const {
+    return readLoadConfigField(
+        buffer, base, coverage, fieldOffset, fieldSize, value);
+  }
+
+#define PEPARSE_LOAD_CONFIG_FIELD(name, out)                        \
+  readField(static_cast<std::uint32_t>(offsetof(LoadConfig, name)), \
+            static_cast<std::uint32_t>(sizeof(LoadConfig::name)),   \
+            out)
+
+  bool securityCookie(std::uint64_t &out) const {
+    return PEPARSE_LOAD_CONFIG_FIELD(SecurityCookie, out);
+  }
+  bool seHandlerTable(std::uint64_t &out) const {
+    return PEPARSE_LOAD_CONFIG_FIELD(SEHandlerTable, out);
+  }
+  bool seHandlerCount(std::uint64_t &out) const {
+    return PEPARSE_LOAD_CONFIG_FIELD(SEHandlerCount, out);
+  }
+  bool guardFlags(std::uint64_t &out) const {
+    return PEPARSE_LOAD_CONFIG_FIELD(GuardFlags, out);
+  }
+  bool guardCFFunctionTable(std::uint64_t &out) const {
+    return PEPARSE_LOAD_CONFIG_FIELD(GuardCFFunctionTable, out);
+  }
+  bool guardCFFunctionCount(std::uint64_t &out) const {
+    return PEPARSE_LOAD_CONFIG_FIELD(GuardCFFunctionCount, out);
+  }
+  bool guardAddressTakenIatEntryTable(std::uint64_t &out) const {
+    return PEPARSE_LOAD_CONFIG_FIELD(GuardAddressTakenIatEntryTable, out);
+  }
+  bool guardAddressTakenIatEntryCount(std::uint64_t &out) const {
+    return PEPARSE_LOAD_CONFIG_FIELD(GuardAddressTakenIatEntryCount, out);
+  }
+  bool guardLongJumpTargetTable(std::uint64_t &out) const {
+    return PEPARSE_LOAD_CONFIG_FIELD(GuardLongJumpTargetTable, out);
+  }
+  bool guardLongJumpTargetCount(std::uint64_t &out) const {
+    return PEPARSE_LOAD_CONFIG_FIELD(GuardLongJumpTargetCount, out);
+  }
+
+#undef PEPARSE_LOAD_CONFIG_FIELD
+};
+
+template <typename LoadConfig>
+static void readLoadConfigMitigations(const std::vector<section> &secs,
+                                      const load_config_reader<LoadConfig> &in,
+                                      VA imageBase,
+                                      mitigation_metadata &metadata,
+                                      bool &truncated,
+                                      bool &inconsistent) {
+  std::uint64_t value = 0;
+
+  // SecurityCookie and the SEH handler table sit before the Guard fields and
+  // are available in older structure revisions.
+  metadata.hasSecurityCookie = in.securityCookie(value);
+  if (metadata.hasSecurityCookie) {
+    metadata.securityCookie = value;
+  }
+
+  std::uint64_t sehTable = 0;
+  std::uint64_t sehCount = 0;
+  if (in.seHandlerTable(sehTable) && in.seHandlerCount(sehCount)) {
+    metadata.hasSEHandlerTable = true;
+    metadata.seHandlerCount = sehCount;
+
+    const mitigation_table_check check =
+        checkMitigationTable(secs,
+                             imageBase,
+                             sehTable,
+                             sehCount,
+                             static_cast<std::uint32_t>(sizeof(std::uint32_t)),
+                             false,
+                             false,
+                             table_flag_rule::IGNORE);
+    metadata.seHandlerTableValid = check.valid;
+    metadata.seHandlerTableRVA = check.rva;
+    inconsistent = inconsistent || check.flagConflict;
+    truncated = truncated || check.truncated;
+
+    // A declared SEH handler table contradicts the optional header telling the
+    // loader that the image has no SEH.
+    if (metadata.noSEH && (sehTable != 0 || sehCount != 0)) {
+      inconsistent = true;
+      metadata.seHandlerTableValid = false;
+    }
+  }
+
+  // GuardFlags describes every Control Flow Guard table below.
+  const bool hasGuardFlags = in.guardFlags(value);
+  metadata.hasGuardFlags = hasGuardFlags;
+  if (hasGuardFlags) {
+    metadata.guardFlags = static_cast<std::uint32_t>(value);
+    metadata.cfgInstrumented =
+        (metadata.guardFlags & IMAGE_GUARD_CF_INSTRUMENTED) != 0;
+    metadata.cfgWriteIntegrity =
+        (metadata.guardFlags & IMAGE_GUARD_CFW_INSTRUMENTED) != 0;
+    metadata.cfgFunctionTablePresent =
+        (metadata.guardFlags & IMAGE_GUARD_CF_FUNCTION_TABLE_PRESENT) != 0;
+    metadata.cfgExportSuppressionInfoPresent =
+        (metadata.guardFlags &
+         IMAGE_GUARD_CF_EXPORT_SUPPRESSION_INFO_PRESENT) != 0;
+    metadata.cfgExportSuppressionEnabled =
+        (metadata.guardFlags & IMAGE_GUARD_CF_ENABLE_EXPORT_SUPPRESSION) != 0;
+    metadata.cfgLongJumpTablePresent =
+        (metadata.guardFlags & IMAGE_GUARD_CF_LONGJUMP_TABLE_PRESENT) != 0;
+    metadata.rfInstrumented =
+        (metadata.guardFlags & IMAGE_GUARD_RF_INSTRUMENTED) != 0;
+    metadata.retpolinePresent =
+        (metadata.guardFlags & IMAGE_GUARD_RETPOLINE_PRESENT) != 0;
+    metadata.securityCookieUnused =
+        (metadata.guardFlags & IMAGE_GUARD_SECURITY_COOKIE_UNUSED) != 0;
+
+    const std::uint32_t strideExtra =
+        (metadata.guardFlags & IMAGE_GUARD_CF_FUNCTION_TABLE_SIZE_MASK) >>
+        IMAGE_GUARD_CF_FUNCTION_TABLE_SIZE_SHIFT;
+    metadata.guardCFFunctionTableStride =
+        static_cast<std::uint32_t>(sizeof(std::uint32_t)) + strideExtra;
+  } else {
+    metadata.guardCFFunctionTableStride =
+        static_cast<std::uint32_t>(sizeof(std::uint32_t));
+  }
+
+  // The optional header may only claim Control Flow Guard support if the load
+  // configuration actually describes instrumentation. A shorter, older
+  // structure that does not reach the GuardFlags field must not be treated as
+  // corrupt, so this cross-check only applies when GuardFlags is available.
+  // The reverse is not required: a module may carry CFG instrumentation
+  // metadata without the image-wide DLL characteristic.
+  if (metadata.controlFlowGuard && hasGuardFlags && !metadata.cfgInstrumented &&
+      !metadata.cfgWriteIntegrity) {
+    inconsistent = true;
+  }
+
+  if (hasGuardFlags && metadata.securityCookieUnused &&
+      metadata.hasSecurityCookie && metadata.securityCookie != 0) {
+    inconsistent = true;
+  }
+
+  // Control Flow Guard function table. Its stride comes from GuardFlags.
+  std::uint64_t cfgTable = 0;
+  std::uint64_t cfgCount = 0;
+  if (in.guardCFFunctionTable(cfgTable) && in.guardCFFunctionCount(cfgCount)) {
+    metadata.hasGuardCFFunctionTable = true;
+    metadata.guardCFFunctionCount = cfgCount;
+
+    const mitigation_table_check check =
+        checkMitigationTable(secs,
+                             imageBase,
+                             cfgTable,
+                             cfgCount,
+                             metadata.guardCFFunctionTableStride,
+                             metadata.cfgFunctionTablePresent,
+                             hasGuardFlags,
+                             table_flag_rule::REQUIRED);
+    metadata.guardCFFunctionTableValid = check.valid;
+    metadata.guardCFFunctionTableRVA = check.rva;
+    inconsistent = inconsistent || check.flagConflict;
+    truncated = truncated || check.truncated;
+  }
+
+  // Address-taken IAT entry table. Export suppression metadata implies that
+  // the table exists, but the table may also exist without that flag.
+  std::uint64_t iatTable = 0;
+  std::uint64_t iatCount = 0;
+  if (in.guardAddressTakenIatEntryTable(iatTable) &&
+      in.guardAddressTakenIatEntryCount(iatCount)) {
+    metadata.hasGuardAddressTakenIatEntryTable = true;
+    metadata.guardAddressTakenIatEntryCount = iatCount;
+
+    const mitigation_table_check check =
+        checkMitigationTable(secs,
+                             imageBase,
+                             iatTable,
+                             iatCount,
+                             static_cast<std::uint32_t>(sizeof(std::uint32_t)),
+                             metadata.cfgExportSuppressionInfoPresent,
+                             hasGuardFlags,
+                             table_flag_rule::REQUIRED_WHEN_FLAGGED);
+    metadata.guardAddressTakenIatEntryTableValid = check.valid;
+    metadata.guardAddressTakenIatEntryTableRVA = check.rva;
+    inconsistent = inconsistent || check.flagConflict;
+    truncated = truncated || check.truncated;
+  }
+
+  // Control Flow Guard long jump target table.
+  std::uint64_t longJumpTable = 0;
+  std::uint64_t longJumpCount = 0;
+  if (in.guardLongJumpTargetTable(longJumpTable) &&
+      in.guardLongJumpTargetCount(longJumpCount)) {
+    metadata.hasGuardLongJumpTargetTable = true;
+    metadata.guardLongJumpTargetCount = longJumpCount;
+
+    const mitigation_table_check check =
+        checkMitigationTable(secs,
+                             imageBase,
+                             longJumpTable,
+                             longJumpCount,
+                             static_cast<std::uint32_t>(sizeof(std::uint32_t)),
+                             metadata.cfgLongJumpTablePresent,
+                             hasGuardFlags,
+                             table_flag_rule::REQUIRED);
+    metadata.guardLongJumpTargetTableValid = check.valid;
+    metadata.guardLongJumpTargetTableRVA = check.rva;
+    inconsistent = inconsistent || check.flagConflict;
+    truncated = truncated || check.truncated;
+  }
+
+  // If GuardFlags advertises a table but the structure does not reach the
+  // fields that describe it, the declaration cannot be backed by the bytes on
+  // hand. That is missing metadata, not a contradiction, so it is reported as
+  // truncation rather than inconsistency.
+  if (hasGuardFlags) {
+    if (metadata.cfgFunctionTablePresent && !metadata.hasGuardCFFunctionTable) {
+      truncated = true;
+    }
+    if (metadata.cfgLongJumpTablePresent &&
+        !metadata.hasGuardLongJumpTargetTable) {
+      truncated = true;
+    }
+    if (metadata.cfgExportSuppressionInfoPresent &&
+        !metadata.hasGuardAddressTakenIatEntryTable) {
+      truncated = true;
+    }
+  }
+}
+
+bool GetMitigationMetadata(parsed_pe *pe, mitigation_metadata &metadata) {
+  metadata = mitigation_metadata{};
+
+  if (pe == nullptr) {
+    PE_ERR(PEERR_NONE);
+    return false;
+  }
+
+  nt_header_32 &nt = pe->peHeader.nt;
+
+  data_directory loadDir;
+  VA imageBase = 0;
+  std::uint16_t dllCharacteristics = 0;
+  if (nt.OptionalMagic == NT_OPTIONAL_32_MAGIC) {
+    loadDir = nt.OptionalHeader.DataDirectory[DIR_LOAD_CONFIG];
+    imageBase = nt.OptionalHeader.ImageBase;
+    dllCharacteristics = nt.OptionalHeader.DllCharacteristics;
+  } else if (nt.OptionalMagic == NT_OPTIONAL_64_MAGIC) {
+    loadDir = nt.OptionalHeader64.DataDirectory[DIR_LOAD_CONFIG];
+    imageBase = nt.OptionalHeader64.ImageBase;
+    dllCharacteristics = nt.OptionalHeader64.DllCharacteristics;
+  } else {
+    PE_ERR(PEERR_MAGIC);
+    return false;
+  }
+
+  metadata.dllCharacteristics = dllCharacteristics;
+  metadata.aslr =
+      (dllCharacteristics & IMAGE_DLLCHARACTERISTICS_DYNAMIC_BASE) != 0;
+  metadata.dep = (dllCharacteristics & IMAGE_DLLCHARACTERISTICS_NX_COMPAT) != 0;
+  // HIGH_ENTROPY_VA is only meaningful for 64-bit images, but it is reported
+  // verbatim so that the result never disagrees with the header declaration.
+  metadata.highEntropyVA =
+      (dllCharacteristics & IMAGE_DLLCHARACTERISTICS_HIGH_ENTROPY_VA) != 0;
+  metadata.forceIntegrity =
+      (dllCharacteristics & IMAGE_DLLCHARACTERISTICS_FORCE_INTEGRITY) != 0;
+  metadata.noSEH = (dllCharacteristics & IMAGE_DLLCHARACTERISTICS_NO_SEH) != 0;
+  metadata.controlFlowGuard =
+      (dllCharacteristics & IMAGE_DLLCHARACTERISTICS_GUARD_CF) != 0;
+
+  // This query never changes the outcome of a parse, and it must not leave a
+  // transient read error behind for the caller to observe. Save and restore
+  // the legacy error state around every probe below.
+  const std::uint32_t savedErr = err;
+  const std::string savedErrLoc = err_loc;
+  struct err_restorer {
+    std::uint32_t &errRef;
+    std::string &errLocRef;
+    std::uint32_t errValue;
+    std::string errLocValue;
+    ~err_restorer() {
+      errRef = errValue;
+      errLocRef = errLocValue;
+    }
+  } restore{err, err_loc, savedErr, savedErrLoc};
+
+  // An all-zero directory entry means the image carries no load configuration
+  // at all. This is the ordinary case for older or lightly-linked images.
+  if (loadDir.VirtualAddress == 0 && loadDir.Size == 0) {
+    metadata.status = MITIGATION_ABSENT;
+    return true;
+  }
+
+  metadata.isPresent = true;
+  metadata.declaredSize = loadDir.Size;
+
+  // A partial declaration cannot be resolved to any bytes.
+  if (loadDir.VirtualAddress == 0 || loadDir.Size == 0) {
+    metadata.status = MITIGATION_TRUNCATED;
+    return true;
+  }
+
+  if (imageBase > std::numeric_limits<VA>::max() - loadDir.VirtualAddress) {
+    metadata.status = MITIGATION_TRUNCATED;
+    return true;
+  }
+
+  const VA loadConfigVA = imageBase + loadDir.VirtualAddress;
+
+  bounded_buffer *buffer = nullptr;
+  std::uint32_t offset = 0;
+  std::uint32_t available = 0;
+  if (pe->internal == nullptr ||
+      !sectionRangeAt(
+          pe->internal->secs, loadConfigVA, buffer, offset, available)) {
+    // The directory points at bytes that are not part of any mapped section.
+    // Never interpret unrelated file data as the structure.
+    metadata.status = MITIGATION_TRUNCATED;
+    return true;
+  }
+
+  if (loadDir.Size > available) {
+    // The declaration reaches past the file-backed data of its section.
+    metadata.status = MITIGATION_TRUNCATED;
+    return true;
+  }
+
+  std::uint32_t structureSize = 0;
+  if (!readDword(buffer, offset, structureSize)) {
+    metadata.status = MITIGATION_TRUNCATED;
+    return true;
+  }
+  metadata.structureSize = structureSize;
+
+  // The structure's Size member is a version check: it must at least describe
+  // itself, must be backed by the section, and must not claim more bytes than
+  // the data directory declares. A structure that only covers a subset of the
+  // known fields is an older format, not corruption; the missing fields are
+  // simply reported as unavailable below.
+  if (structureSize < sizeof(std::uint32_t) || structureSize > available ||
+      structureSize > loadDir.Size) {
+    metadata.status = MITIGATION_TRUNCATED;
+    return true;
+  }
+
+  const std::uint32_t coverage = structureSize;
+
+  bool truncated = false;
+  bool inconsistent = false;
+  if (nt.OptionalMagic == NT_OPTIONAL_32_MAGIC) {
+    const load_config_reader<image_load_config_32> in{buffer, offset, coverage};
+    readLoadConfigMitigations(
+        pe->internal->secs, in, imageBase, metadata, truncated, inconsistent);
+  } else {
+    const load_config_reader<image_load_config_64> in{buffer, offset, coverage};
+    readLoadConfigMitigations(
+        pe->internal->secs, in, imageBase, metadata, truncated, inconsistent);
+  }
+
+  if (truncated) {
+    metadata.status = MITIGATION_TRUNCATED;
+  } else if (inconsistent) {
+    metadata.status = MITIGATION_INCONSISTENT;
+  } else {
+    metadata.status = MITIGATION_CONSISTENT;
+  }
+
+  return true;
+}
+
 } // namespace peparse

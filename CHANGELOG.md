@@ -9,6 +9,14 @@ All versions prior to [2.0.0] are untracked.
 
 ## [Unreleased]
 
+### Added
+
+- Added load configuration (mitigation metadata) parsing via
+  `GetMitigationMetadata`. The result reports whether the image's security
+  features, `GuardFlags`, and Control Flow Guard / SEH tables are absent,
+  truncated, inconsistent, or consistent, honoring the versioned `Size` of the
+  structure so that older minimal structures are not treated as corrupt.
+
 ## [3.0.0-rc.1] - 2026-05-22
 
 ### Added

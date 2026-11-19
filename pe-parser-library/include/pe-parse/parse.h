@@ -181,6 +181,102 @@ typedef struct _parsed_pe {
   pe_header peHeader;
 } parsed_pe;
 
+/*
+ * The load configuration directory carries the mitigation metadata that the
+ * linker claims the image was built with. Its fields are versioned by the
+ * structure's own Size member: older linkers emit shorter structures, so a
+ * field that is not covered by that size is simply unavailable, not corrupt.
+ *
+ * A consumer needs to distinguish four outcomes:
+ *   ABSENT       - the image declares no load configuration directory.
+ *   TRUNCATED    - the declaration exists, but the bytes it refers to are not
+ *                  fully available (unmapped RVA, range past the containing
+ *                  section, or a Size member that does not describe itself).
+ *   INCONSISTENT - the bytes are available, but the declared security
+ *                  features, GuardFlags, or the tables they reference
+ *                  contradict each other or point outside the image.
+ *   CONSISTENT   - the available declaration is complete and agrees with
+ *                  itself and with the optional header.
+ *
+ * Bytes beyond the structure's Size member are never interpreted as fields or
+ * tables, even when they lie inside the same section.
+ */
+enum mitigation_status {
+  MITIGATION_ABSENT = 0,
+  MITIGATION_TRUNCATED = 1,
+  MITIGATION_INCONSISTENT = 2,
+  MITIGATION_CONSISTENT = 3,
+};
+
+struct mitigation_metadata {
+  mitigation_status status;
+
+  // Security features as declared by the optional header DllCharacteristics.
+  std::uint16_t dllCharacteristics;
+  bool aslr;             // IMAGE_DLLCHARACTERISTICS_DYNAMIC_BASE
+  bool dep;              // IMAGE_DLLCHARACTERISTICS_NX_COMPAT
+  bool highEntropyVA;    // declared bit; meaningful only for 64-bit images
+  bool forceIntegrity;   // IMAGE_DLLCHARACTERISTICS_FORCE_INTEGRITY
+  bool noSEH;            // IMAGE_DLLCHARACTERISTICS_NO_SEH
+  bool controlFlowGuard; // IMAGE_DLLCHARACTERISTICS_GUARD_CF
+
+  // Load configuration directory and structure sizes (in bytes).
+  bool isPresent;
+  std::uint32_t declaredSize;  // data directory Size
+  std::uint32_t structureSize; // Size member of the load config structure
+
+  // Fields below are only meaningful when their has* flag is set. A scalar
+  // has* flag is set exactly when the structure's Size covers the complete
+  // field; a table has* flag is set when the structure covers both the
+  // table's pointer and its count.
+  bool hasSecurityCookie;
+  std::uint64_t securityCookie;
+  bool securityCookieUnused; // IMAGE_GUARD_SECURITY_COOKIE_UNUSED
+
+  bool hasGuardFlags;
+  std::uint32_t guardFlags;
+  bool cfgInstrumented;
+  bool cfgWriteIntegrity;
+  bool cfgFunctionTablePresent;
+  bool cfgExportSuppressionInfoPresent;
+  bool cfgExportSuppressionEnabled;
+  bool cfgLongJumpTablePresent;
+  bool rfInstrumented;
+  bool retpolinePresent;
+
+  bool hasGuardCFFunctionTable;
+  std::uint32_t guardCFFunctionTableRVA;
+  std::uint64_t guardCFFunctionCount;
+  std::uint32_t guardCFFunctionTableStride;
+  // True when the flag/pointer/count combination agrees with itself and the
+  // whole table lies inside one section's file-backed data.
+  bool guardCFFunctionTableValid;
+
+  bool hasGuardAddressTakenIatEntryTable;
+  std::uint32_t guardAddressTakenIatEntryTableRVA;
+  std::uint64_t guardAddressTakenIatEntryCount;
+  bool guardAddressTakenIatEntryTableValid;
+
+  bool hasGuardLongJumpTargetTable;
+  std::uint32_t guardLongJumpTargetTableRVA;
+  std::uint64_t guardLongJumpTargetCount;
+  bool guardLongJumpTargetTableValid;
+
+  bool hasSEHandlerTable;
+  std::uint32_t seHandlerTableRVA;
+  std::uint64_t seHandlerCount;
+  bool seHandlerTableValid;
+};
+
+// Resolve the mitigation metadata of an already parsed PE. Returns false only
+// when no metadata can be produced at all (null handle or unrecognized
+// optional header magic); every per-image condition is reported through
+// metadata.status instead. This query never changes the outcome of a parse.
+bool GetMitigationMetadata(parsed_pe *pe, mitigation_metadata &metadata);
+
+// Human-readable form of a mitigation_status value.
+const char *GetMitigationStatusAsString(mitigation_status status);
+
 // Resolve a Rich header product id / build number pair to a known
 // product name
 typedef std::pair<std::uint16_t, std::uint16_t> ProductKey;

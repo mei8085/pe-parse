@@ -226,6 +226,23 @@ constexpr std::uint16_t IMAGE_DLLCHARACTERISTICS_TERMINAL_SERVER_AWARE = 0x8000;
 
 // Extended DLL characteristics
 constexpr std::uint16_t IMAGE_DLLCHARACTERISTICS_EX_CET_COMPAT = 0x0001;
+
+// Load configuration GuardFlags bits. These describe the mitigation metadata
+// that the linker claims to have placed in the load configuration directory.
+constexpr std::uint32_t IMAGE_GUARD_CF_INSTRUMENTED = 0x00000100;
+constexpr std::uint32_t IMAGE_GUARD_CFW_INSTRUMENTED = 0x00000200;
+constexpr std::uint32_t IMAGE_GUARD_CF_FUNCTION_TABLE_PRESENT = 0x00000400;
+constexpr std::uint32_t IMAGE_GUARD_SECURITY_COOKIE_UNUSED = 0x00000800;
+constexpr std::uint32_t IMAGE_GUARD_CF_EXPORT_SUPPRESSION_INFO_PRESENT =
+    0x00004000;
+constexpr std::uint32_t IMAGE_GUARD_CF_ENABLE_EXPORT_SUPPRESSION = 0x00008000;
+constexpr std::uint32_t IMAGE_GUARD_CF_LONGJUMP_TABLE_PRESENT = 0x00010000;
+constexpr std::uint32_t IMAGE_GUARD_RF_INSTRUMENTED = 0x00020000;
+constexpr std::uint32_t IMAGE_GUARD_RETPOLINE_PRESENT = 0x00100000;
+// Mask for the subfield that carries the stride of the Control Flow Guard
+// function table entries, as an additional count of bytes per entry.
+constexpr std::uint32_t IMAGE_GUARD_CF_FUNCTION_TABLE_SIZE_MASK = 0xF0000000;
+constexpr std::uint32_t IMAGE_GUARD_CF_FUNCTION_TABLE_SIZE_SHIFT = 28;
 #endif
 // clang-format on
 
