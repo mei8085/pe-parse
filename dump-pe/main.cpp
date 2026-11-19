@@ -444,6 +444,8 @@ int main(int argc, char *argv[]) {
     DUMP_FIELD(dos.e_lfanew);
     // Print Rich header info
     DUMP_BOOL_FIELD(rich.isPresent);
+    std::cout << "rich.Status: "
+              << GetRichHeaderStatusString(GetRichHeaderStatus(p)) << "\n";
     if (p->peHeader.rich.isPresent) {
       DUMP_FIELD(rich.DecryptionKey);
       DUMP_FIELD(rich.Checksum);

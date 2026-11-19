@@ -187,6 +187,14 @@ typedef std::pair<std::uint16_t, std::uint16_t> ProductKey;
 const std::string &GetRichObjectType(std::uint16_t prodId);
 const std::string &GetRichProductName(std::uint16_t buildNum);
 
+// Get the validation verdict for the Rich header of a parsed PE.
+//
+// Returns RICH_STATUS_ABSENT if pe is null.
+rich_header_status GetRichHeaderStatus(const parsed_pe *pe);
+
+// Get a stable, human readable name for a Rich header status.
+const char *GetRichHeaderStatusString(rich_header_status status);
+
 // get parser error status as integer
 std::uint32_t GetPEErr();
 

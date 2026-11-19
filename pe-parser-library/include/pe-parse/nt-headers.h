@@ -36,6 +36,41 @@ namespace peparse {
 constexpr std::uint32_t RICH_MAGIC_END = 0x68636952;
 constexpr std::uint32_t RICH_MAGIC_START = 0x536e6144;
 constexpr std::uint32_t RICH_OFFSET = 0x80;
+
+// Size, in bytes, of the "DanS" marker plus the three copies of the XOR
+// checksum key that immediately follow it.
+constexpr std::uint32_t RICH_HEADER_PREFIX_SIZE = 16;
+
+// Size, in bytes, of a single (comp.id, count) Rich header entry.
+constexpr std::uint32_t RICH_ENTRY_SIZE = 8;
+
+// The Rich header lives in the DOS stub, after the DOS header proper.
+// Offsets below RICH_MIN_OFFSET belong to the DOS header itself and are not
+// considered when looking for a Rich header, so that incidental bytes in the
+// DOS area cannot be mistaken for a build fingerprint.
+constexpr std::uint32_t RICH_MIN_OFFSET = 0x40;
+
+// Outcome of validating a Rich header as a build fingerprint.
+//
+// The values are stable and ordered so that callers may persist them:
+//   RICH_STATUS_ABSENT                no Rich header structure was located
+//   RICH_STATUS_TRUNCATED             the structure starts but is cut short
+//                                     (no "Rich" end marker before the PE
+//                                     header, or fields run past the boundary)
+//   RICH_STATUS_CHECKSUM_MISMATCH     structure is complete but the checksum
+//                                     (XOR key) does not match, which indicates
+//                                     deliberate or accidental modification
+//   RICH_STATUS_ENTRY_LENGTH_ANOMALY  the entry area is not a whole number of
+//                                     entries, so the structure is malformed
+//   RICH_STATUS_VALID                 structure and checksum are consistent;
+//                                     the header is a trustworthy fingerprint
+enum rich_header_status {
+  RICH_STATUS_ABSENT = 0,
+  RICH_STATUS_TRUNCATED = 1,
+  RICH_STATUS_CHECKSUM_MISMATCH = 2,
+  RICH_STATUS_ENTRY_LENGTH_ANOMALY = 3,
+  RICH_STATUS_VALID = 4,
+};
 constexpr std::uint16_t MZ_MAGIC = 0x5A4D;
 constexpr std::uint32_t NT_MAGIC = 0x00004550;
 constexpr std::uint16_t NUM_DIR_ENTRIES = 16;
@@ -376,6 +411,16 @@ struct rich_header {
   std::uint32_t EndSignature;
   std::uint32_t DecryptionKey;
   std::uint32_t Checksum;
+  // Verdict for this header as a build fingerprint. See rich_header_status.
+  rich_header_status Status;
+  // File offsets of the decrypted "DanS" marker and the "Rich" end marker.
+  // Zero when the corresponding marker was not located.
+  std::uint32_t StartOffset;
+  std::uint32_t EndOffset;
+  // Kept for backwards compatibility:
+  //   isPresent is true whenever a "DanS" start marker was located, even if
+  //   the structure is truncated or fails validation.
+  //   isValid is true only for RICH_STATUS_VALID.
   bool isPresent;
   bool isValid;
 };

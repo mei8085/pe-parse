@@ -9,6 +9,23 @@ All versions prior to [2.0.0] are untracked.
 
 ## [Unreleased]
 
+### Added
+
+- Added strict Rich header fingerprint validation. Rich headers are now located
+  by their canonical `DanS ^ key, key, key, key` prefix and `Rich` trailer
+  instead of a fixed offset, and every parse reports a stable
+  `rich_header_status` (`GetRichHeaderStatus`,
+  `GetRichHeaderStatusString`) distinguishing an absent header, a truncated
+  structure, an entry-length anomaly, a checksum mismatch (tampering) and a
+  consistent header. `dump-pe` prints the status.
+
+### Fixed
+
+- Rich header validation no longer mistakes incidental bytes in the DOS stub
+  for a fingerprint, and no longer walks entries by their declared count, so
+  duplicate or zero-length entries cannot move reads past the buffer
+  boundary. Files without a Rich header parse exactly as before.
+
 ## [3.0.0-rc.1] - 2026-05-22
 
 ### Added

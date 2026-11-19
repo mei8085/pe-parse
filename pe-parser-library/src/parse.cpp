@@ -495,6 +495,33 @@ const std::string &GetRichProductName(std::uint16_t buildNum) {
   }
 }
 
+// Returns the validation verdict for a parsed PE's Rich header
+rich_header_status GetRichHeaderStatus(const parsed_pe *pe) {
+  if (pe == nullptr) {
+    return RICH_STATUS_ABSENT;
+  }
+
+  return pe->peHeader.rich.Status;
+}
+
+// Returns a stable, human readable name for a Rich header validation verdict
+const char *GetRichHeaderStatusString(rich_header_status status) {
+  switch (status) {
+    case RICH_STATUS_ABSENT:
+      return "absent";
+    case RICH_STATUS_TRUNCATED:
+      return "truncated";
+    case RICH_STATUS_CHECKSUM_MISMATCH:
+      return "checksum-mismatch";
+    case RICH_STATUS_ENTRY_LENGTH_ANOMALY:
+      return "entry-length-anomaly";
+    case RICH_STATUS_VALID:
+      return "valid";
+    default:
+      return "unknown";
+  }
+}
+
 std::uint32_t err = 0;
 std::string err_loc;
 
@@ -1318,112 +1345,280 @@ static inline std::uint32_t rol(std::uint32_t val, std::uint32_t num) {
 #endif
 }
 
-std::uint32_t calculateRichChecksum(const bounded_buffer *b, pe_header &p) {
+namespace {
 
-  // First, calculate the sum of the DOS header bytes each rotated left the
-  // number of times their position relative to the start of the DOS header e.g.
-  // second byte is rotated left 2x using rol operation
+// The Rich header is a little-endian structure, regardless of the byte order
+// of the machine recorded in the NT headers. Read DWORDS directly so that the
+// scan for a fingerprint never depends on state that is only known after the
+// NT headers have been parsed.
+std::uint32_t readRichDword(const std::uint8_t *base, std::uint32_t offset) {
+  return static_cast<std::uint32_t>(base[offset]) |
+         (static_cast<std::uint32_t>(base[offset + 1]) << 8) |
+         (static_cast<std::uint32_t>(base[offset + 2]) << 16) |
+         (static_cast<std::uint32_t>(base[offset + 3]) << 24);
+}
+
+enum class rich_start_kind {
+  none,
+  // "DanS" and two copies of the key fit before the boundary, but the third
+  // copy does not. Enough evidence to call the structure truncated, but not
+  // enough to parse entries.
+  partial,
+  // "DanS" and all three copies of the key are present: a canonical prefix.
+  full,
+};
+
+// Decide whether the DWORDS at `start` look like the encrypted "DanS" marker
+// that opens a Rich header.
+//
+// A canonical prefix is:
+//
+//   DanS ^ key, key, key, key
+//
+// i.e. the "DanS" marker followed by three copies of the XOR key (the
+// plaintext zero padding XORed with the key). Requiring three matching DWORDS
+// that satisfy the DanS relation makes it effectively impossible for
+// incidental bytes in the DOS stub to be mistaken for a fingerprint.
+rich_start_kind classifyRichStart(const std::uint8_t *base,
+                                  std::uint32_t start,
+                                  std::uint32_t limit,
+                                  std::uint32_t &key) {
+  if (start > limit) {
+    return rich_start_kind::none;
+  }
+
+  const std::uint32_t available = limit - start;
+  constexpr std::uint32_t kDword = sizeof(std::uint32_t);
+  constexpr std::uint32_t kMinEvidence = 3 * kDword;
+
+  // The marker plus at least two key copies are required to trust the match.
+  if (available < kMinEvidence) {
+    return rich_start_kind::none;
+  }
+
+  const std::uint32_t candidate = readRichDword(base, start + kDword);
+  if (readRichDword(base, start + (2 * kDword)) != candidate) {
+    return rich_start_kind::none;
+  }
+  if ((readRichDword(base, start) ^ candidate) != RICH_MAGIC_START) {
+    return rich_start_kind::none;
+  }
+
+  key = candidate;
+
+  if (available < RICH_HEADER_PREFIX_SIZE) {
+    return rich_start_kind::partial;
+  }
+  if (readRichDword(base, start + (3 * kDword)) != candidate) {
+    return rich_start_kind::none;
+  }
+
+  return rich_start_kind::full;
+}
+
+// Sum of the Rich header checksum contributions for the bytes that precede
+// the "DanS" marker, plus the rotated sums of each entry, plus the offset of
+// the marker itself.
+//
+// The e_lfanew field (offset 0x3C..0x3F) is excluded because it is patched
+// after the DOS stub is generated.
+std::uint32_t calculateRichChecksum(const std::uint8_t *base,
+                                    std::uint32_t startOffset,
+                                    const std::vector<rich_entry> &entries) {
   std::uint32_t checksum = 0;
 
-  for (uint8_t i = 0; i < RICH_OFFSET; i++) {
-
-    // skip over dos e_lfanew field at offset 0x3C
+  for (std::uint32_t i = 0; i < startOffset; i++) {
+    // skip over the dos e_lfanew field at offset 0x3C
     if (i >= 0x3C && i <= 0x3F) {
       continue;
     }
-    checksum += rol(b->buf[i], i & 0x1F);
+    checksum += rol(base[i], i & 0x1F);
   }
 
-  // Next, take summation of each Rich header entry by combining its ProductId
-  // and BuildNumber into a single 32 bit number and rotating by its count.
-  for (rich_entry entry : p.rich.Entries) {
-    std::uint32_t num =
-        static_cast<std::uint32_t>((entry.ProductId << 16) | entry.BuildNumber);
+  for (const rich_entry &entry : entries) {
+    std::uint32_t num = static_cast<std::uint32_t>(
+        (static_cast<std::uint32_t>(entry.ProductId) << 16) |
+        static_cast<std::uint32_t>(entry.BuildNumber));
     checksum += rol(num, entry.Count & 0x1F);
   }
 
-  checksum += RICH_OFFSET;
+  checksum += startOffset;
 
   return checksum;
 }
 
-bool readRichHeader(bounded_buffer *rich_buf,
-                    std::uint32_t key,
-                    rich_header &rich_hdr) {
-  if (rich_buf == nullptr) {
-    return false;
+// Locate and validate a Rich header inside [RICH_MIN_OFFSET, limit).
+//
+// This never aborts a PE parse: a missing, truncated, malformed or tampered
+// header is reported through rich_hdr.Status and the parse continues, which
+// preserves the historical behavior for files that do not carry a Rich
+// header.
+void parseRichHeader(const std::uint8_t *base,
+                     std::uint32_t limit,
+                     rich_header &rich_hdr) {
+  rich_hdr.StartSignature = 0;
+  rich_hdr.Entries.clear();
+  rich_hdr.EndSignature = 0;
+  rich_hdr.DecryptionKey = 0;
+  rich_hdr.Checksum = 0;
+  rich_hdr.Status = RICH_STATUS_ABSENT;
+  rich_hdr.StartOffset = 0;
+  rich_hdr.EndOffset = 0;
+  rich_hdr.isPresent = false;
+  rich_hdr.isValid = false;
+
+  if (base == nullptr) {
+    return;
   }
 
-  std::uint32_t encrypted_dword;
-  std::uint32_t decrypted_dword;
+  constexpr std::uint32_t kDword = sizeof(std::uint32_t);
 
-  // Confirm DanS signature exists first.
-  // The first decrypted DWORD value of the rich header
-  // at offset 0 should be 0x536e6144 aka the "DanS" signature
-  if (!readDword(rich_buf, 0, encrypted_dword)) {
-    PE_ERR(PEERR_READ);
-    return false;
+  // Find the opening "DanS" marker. Only complete, canonical prefixes are
+  // accepted as the real thing; a partial prefix (marker plus two key copies)
+  // is remembered but the scan keeps going, so that incidental bytes cannot
+  // preempt a genuine header further along. If no complete prefix is found,
+  // the remembered partial one is reported so a structure cut off by
+  // e_lfanew is described as truncated rather than absent.
+  std::uint32_t startOffset = 0;
+  std::uint32_t prefixKey = 0;
+  bool foundStart = false;
+  bool startComplete = false;
+  std::uint32_t partialOffset = 0;
+  std::uint32_t partialKey = 0;
+  bool foundPartial = false;
+
+  for (std::uint32_t pos = RICH_MIN_OFFSET;
+       limit >= pos && limit - pos >= 3 * kDword;
+       pos += kDword) {
+    std::uint32_t candidateKey = 0;
+    const rich_start_kind kind =
+        classifyRichStart(base, pos, limit, candidateKey);
+    if (kind == rich_start_kind::full) {
+      startOffset = pos;
+      prefixKey = candidateKey;
+      foundStart = true;
+      startComplete = true;
+      break;
+    }
+    if (kind == rich_start_kind::partial && !foundPartial) {
+      partialOffset = pos;
+      partialKey = candidateKey;
+      foundPartial = true;
+    }
   }
 
-  decrypted_dword = encrypted_dword ^ key;
-
-  if (decrypted_dword == RICH_MAGIC_START) {
-    // DanS magic found
-    rich_hdr.isPresent = true;
-    rich_hdr.StartSignature = decrypted_dword;
-  } else {
-    // DanS magic not found
-    rich_hdr.isPresent = false;
-    return false;
+  if (!foundStart && foundPartial) {
+    startOffset = partialOffset;
+    prefixKey = partialKey;
+    foundStart = true;
+    startComplete = false;
   }
 
-  // Iterate over the remaining entries.
-  // Start from buffer offset 16 because after "DanS" there
-  // are three DWORDs of zero padding that can be skipped over.
-  // a DWORD is 4 bytes. Loop is incrementing 8 bytes, however
-  // we are reading two DWORDS at a time, which is the size
-  // of one rich header entry.
-  for (std::uint32_t i = 16; i < rich_buf->bufLen - 8; i += 8) {
+  if (!foundStart) {
+    return;
+  }
+
+  // From here on a start marker has been identified.
+  rich_hdr.isPresent = true;
+  rich_hdr.StartSignature = RICH_MAGIC_START;
+  rich_hdr.StartOffset = startOffset;
+  rich_hdr.DecryptionKey = prefixKey;
+
+  if (!startComplete) {
+    rich_hdr.Status = RICH_STATUS_TRUNCATED;
+    return;
+  }
+
+  // The entry area runs from the end of the prefix up to the trailing "Rich"
+  // marker. Search for the marker without assuming an entry count, so a bogus
+  // or zero entry count can never move a read past the boundary.
+  //
+  // Prefer a "Rich" marker that is followed by the same key seen in the
+  // prefix; a marker whose follower disagrees is only used as a fallback so
+  // that a genuine key substitution is still reported as a checksum mismatch
+  // rather than mistaken for truncation.
+  const std::uint32_t entriesOffset = startOffset + RICH_HEADER_PREFIX_SIZE;
+  std::uint32_t endOffset = 0;
+  bool foundEnd = false;
+
+  for (std::uint32_t pos = entriesOffset;
+       limit >= pos && limit - pos >= 2 * kDword;
+       pos += kDword) {
+    if (readRichDword(base, pos) != RICH_MAGIC_END) {
+      continue;
+    }
+
+    if (!foundEnd) {
+      endOffset = pos;
+      foundEnd = true;
+    }
+
+    if (readRichDword(base, pos + kDword) == prefixKey) {
+      endOffset = pos;
+      foundEnd = true;
+      break;
+    }
+  }
+
+  if (!foundEnd) {
+    rich_hdr.Status = RICH_STATUS_TRUNCATED;
+    return;
+  }
+
+  rich_hdr.EndSignature = RICH_MAGIC_END;
+  rich_hdr.EndOffset = endOffset;
+
+  // The DWORD after the trailing marker is the canonical decryption key.
+  const std::uint32_t trailerKey = readRichDword(base, endOffset + kDword);
+  rich_hdr.DecryptionKey = trailerKey;
+
+  const std::uint32_t entryBytes = endOffset - entriesOffset;
+  const std::uint32_t entryCount = entryBytes / RICH_ENTRY_SIZE;
+
+  // Entries are fixed-width records; walk them by their on-disk size, never
+  // by a count derived from the contents. This keeps duplicate product ids,
+  // zero counts, and zero entries from affecting the walk.
+  rich_hdr.Entries.reserve(entryCount);
+  for (std::uint32_t i = 0; i < entryCount; i++) {
+    const std::uint32_t off = entriesOffset + (i * RICH_ENTRY_SIZE);
+    const std::uint32_t compId = readRichDword(base, off) ^ trailerKey;
+    const std::uint32_t count = readRichDword(base, off + kDword) ^ trailerKey;
+
     rich_entry entry;
-    // Read first DWORD of entry and decrypt it
-    if (!readDword(rich_buf, i, encrypted_dword)) {
-      PE_ERR(PEERR_READ);
-      return false;
-    }
-    decrypted_dword = encrypted_dword ^ key;
-    // The high WORD of the first DWORD is the Product ID
-    entry.ProductId = (decrypted_dword & 0xFFFF0000) >> 16;
-    // The low WORD of the first DWORD is the Build Number
-    entry.BuildNumber = (decrypted_dword & 0xFFFF);
-
-    // The second DWORD represents the use count
-    if (!readDword(rich_buf, i + 4, encrypted_dword)) {
-      PE_ERR(PEERR_READ);
-      return false;
-    }
-    decrypted_dword = encrypted_dword ^ key;
-    // The full 32-bit DWORD is the count
-    entry.Count = decrypted_dword;
-
-    // Preserve the individual entry
+    entry.ProductId = static_cast<std::uint16_t>((compId >> 16) & 0xFFFF);
+    entry.BuildNumber = static_cast<std::uint16_t>(compId & 0xFFFF);
+    entry.Count = count;
     rich_hdr.Entries.push_back(entry);
   }
 
-  // Preserve the end signature aka "Rich" magic
-  if (!readDword(rich_buf, rich_buf->bufLen - 4, rich_hdr.EndSignature)) {
-    PE_ERR(PEERR_READ);
-    return false;
-  };
-  if (rich_hdr.EndSignature != RICH_MAGIC_END) {
-    PE_ERR(PEERR_MAGIC);
-    return false;
+  rich_hdr.Checksum =
+      calculateRichChecksum(base, startOffset, rich_hdr.Entries);
+
+  // Precedence: a malformed length is reported before checksum agreement,
+  // because a structure whose entry area is not a whole number of entries
+  // cannot be interpreted as a fingerprint at all.
+  if ((entryBytes % RICH_ENTRY_SIZE) != 0) {
+    rich_hdr.Status = RICH_STATUS_ENTRY_LENGTH_ANOMALY;
+    return;
   }
 
-  // Preserve the decryption key
-  rich_hdr.DecryptionKey = key;
+  // The three copies of the key in the prefix must agree with the key stored
+  // after the trailing marker.
+  if (prefixKey != trailerKey) {
+    rich_hdr.Status = RICH_STATUS_CHECKSUM_MISMATCH;
+    return;
+  }
 
-  return true;
+  if (rich_hdr.Checksum != rich_hdr.DecryptionKey) {
+    rich_hdr.Status = RICH_STATUS_CHECKSUM_MISMATCH;
+    return;
+  }
+
+  rich_hdr.Status = RICH_STATUS_VALID;
+  rich_hdr.isValid = true;
 }
+
+} // anonymous namespace
 
 bool readDosHeader(bounded_buffer *file, dos_header &dos_hdr) {
   if (file == nullptr) {
@@ -1482,74 +1677,25 @@ bool getHeader(bounded_buffer *file, pe_header &p, bounded_buffer *&rem) {
   std::uint32_t offset = p.dos.e_lfanew;
   std::uint32_t curOffset = offset;
 
-  // read rich header
-  std::uint32_t dword;
-  std::uint32_t rich_end_signature_offset = 0;
-  std::uint32_t xor_key;
-  bool found_rich = false;
-
-  // Start reading from RICH_OFFSET (0x80), a known Rich header offset.
-  // Note: 0x80 is based on anecdotal evidence.
-  //
-  // Iterate over the DWORDs, hence why i increments 4 bytes at a time.
-  for (std::uint32_t i = RICH_OFFSET; i < offset; i += 4) {
-    if (!readDword(file, i, dword)) {
-      PE_ERR(PEERR_READ);
-      return false;
-    }
-
-    // Found the trailing Rich signature
-    if (dword == RICH_MAGIC_END) {
-      found_rich = true;
-      rich_end_signature_offset = i;
-      break;
-    }
-  }
-
-  if (found_rich) {
-    // Get the XOR decryption key.  It is the DWORD immediately
-    // after the Rich signature.
-    if (!readDword(file, rich_end_signature_offset + 4, xor_key)) {
-      PE_ERR(PEERR_READ);
-      return false;
-    }
-
-    // Split the Rich header out into its own buffer
-    bounded_buffer *richBuf =
-        splitBuffer(file, 0x80, rich_end_signature_offset + 4);
-    if (richBuf == nullptr) {
-      return false;
-    }
-
-    readRichHeader(richBuf, xor_key, p.rich);
-    if (richBuf != nullptr) {
-      deleteBuffer(richBuf);
-    }
-
-    // Split the DOS header into a separate buffer which
-    // starts at offset 0 and has length 0x80
-    bounded_buffer *dosBuf = splitBuffer(file, 0, RICH_OFFSET);
-    if (dosBuf == nullptr) {
-      return false;
-    }
-    // Calculate checksum
-    p.rich.Checksum = calculateRichChecksum(dosBuf, p);
-    if (p.rich.Checksum == p.rich.DecryptionKey) {
-      p.rich.isValid = true;
-    } else {
-      p.rich.isValid = false;
-    }
-    if (dosBuf != nullptr) {
-      deleteBuffer(dosBuf);
-    }
-
-    // Rich header not present
-  } else {
-    p.rich.isPresent = false;
-  }
+  // Locate and validate the Rich header, if any, in the DOS stub. The scan is
+  // bounded by the PE header and by the file itself, both of which are known
+  // here, so a hostile e_lfanew cannot make the scan walk out of the buffer.
+  // A malformed or missing Rich header never fails the parse; its verdict is
+  // recorded in p.rich.Status instead.
+  const std::uint32_t richLimit = std::min<std::uint32_t>(offset, file->bufLen);
+  parseRichHeader(file->buf, richLimit, p.rich);
 
   // now, we can read out the fields of the NT headers
   bounded_buffer *ntBuf = splitBuffer(file, curOffset, file->bufLen);
+
+  if (ntBuf == nullptr) {
+    // e_lfanew points past the end of the file. Historically this path was
+    // reached by the Rich header scan running off the end of the buffer, which
+    // reported PEERR_READ; keep that error for compatibility now that the
+    // scan is bounded.
+    PE_ERR(PEERR_READ);
+    return false;
+  }
 
   if (!readNtHeader(ntBuf, p.nt)) {
     // err is set by readNtHeader
